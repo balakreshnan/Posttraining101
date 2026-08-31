@@ -1,0 +1,7 @@
+# For use inside the gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel
+# container on hecate -- that image already bundles a CUDA-matched torch,
+# so we deliberately don't pin/install torch here.
+transformers>=4.44
+datasets>=2.20
+numpy>=1.26
+tqdm>=4.66

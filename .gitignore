@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# RLVR project (rlvr/)
+.venv314/
+rlvr/out/
+rlvr/*.log
+rlvr/logs/
+rlvr/.venv-upload/
