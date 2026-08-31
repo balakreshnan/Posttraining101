@@ -1,3 +1,119 @@
+# Hecate execute shell — multi-GPU / DDP (copy/paste blocks)
+
+These are the exact commands to stand up and run the RLVR sample on
+hecate using **4-GPU data-parallel training (DDP via `torchrun`)** --
+each GPU holds its own model replica, samples its own batch (seeded
+per-rank), and gradients are all-reduced across ranks every step.
+Effective global batch = 4 x `--batch-size`. Defaults to 1000
+iterations. Paste each block as-is into your already-authenticated
+hecate terminal, in order. See [`README_cluster.md`](README_cluster.md)
+for the narrative walkthrough, or
+[`executeshell-singlegpu.md`](executeshell-singlegpu.md) for the
+validated single-GPU (150-iteration) version.
+
+## Block 1 — write the RLVR code to Lustre
+
+Writes `task.py`, `train_rlvr.py`, `requirements-cluster.txt`, and
+`scripts/launch_rlvr.sh` under
+`/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101`.
+
+```bash
+export ACCOUNT="general_sa"
+export LUSTRE_DIR="/lustre/fsw/$ACCOUNT/$USER"
+export PROJECT_DIR="$LUSTRE_DIR/rlvr-posttraining101"
+mkdir -p "$PROJECT_DIR/scripts" "$PROJECT_DIR/out" "$LUSTRE_DIR/hf_cache"
+
+cat > "$PROJECT_DIR/task.py" << 'PYEOF'
+"""Synthetic verifiable-reward task for the RLVR sample.
+
+The task is deliberately simple (two-operand arithmetic) so the whole
+pipeline can be trained and verified on a laptop CPU in a couple of
+minutes. Swap this module out for a harder verifiable task (GSM8K,
+code execution, unit tests, etc.) once the pipeline is validated.
+
+Per-operator operand ranges are tuned so the task is hard enough to
+leave real room for RL to improve a ~1.5B instruct model, but not so
+hard (e.g. raw 3-digit x 3-digit multiplication) that it's essentially
+unsolvable without much longer chain-of-thought budgets.
+"""
+
+import random
+import re
+
+OPS = {
+    "+": lambda a, b: a + b,
+    "-": lambda a, b: a - b,
+    "*": lambda a, b: a * b,
+}
+
+# (min_operand, max_operand) per operator -- multiplication gets a
+# smaller range since it's much harder for a small LM to do reliably.
+OPERAND_RANGES = {
+    "+": (10, 999),
+    "-": (10, 999),
+    "*": (2, 50),
+}
+
+PROMPT_TEMPLATE = "Question: What is {a} {op} {b}?\nAnswer: The result is"
+
+_QUESTION_TEMPLATE = (
+    "What is {a} {op} {b}? "
+    "You may reason briefly, but end your reply with exactly one line "
+    "in the form 'Final Answer: <number>'."
+)
+
+# Prefer the number following "Final Answer" if the model followed the
+# requested format; otherwise fall back to the last integer anywhere in
+# the completion (covers models/formats that skip the exact phrase).
+_FINAL_ANSWER_RE = re.compile(r"Final Answer:\s*(-?\d+)", re.IGNORECASE)
+_ANSWER_RE = re.compile(r"-?\d+")
+
+
+def sample_problem(rng: random.Random, max_operand: int | None = None) -> dict:
+    op = rng.choice(list(OPS.keys()))
+    lo, hi = OPERAND_RANGES[op]
+    if max_operand is not None:
+        hi = min(hi, max_operand)
+    a = rng.randint(lo, hi)
+    b = rng.randint(lo, hi)
+    answer = OPS[op](a, b)
+    question = _QUESTION_TEMPLATE.format(a=a, op=op, b=b)
+    prompt = PROMPT_TEMPLATE.format(a=a, op=op, b=b)
+    return {"question": question, "prompt": prompt, "answer": answer}
+
+
+def sample_batch(rng: random.Random, batch_size: int, max_operand: int | None = None) -> list[dict]:
+    return [sample_problem(rng, max_operand) for _ in range(batch_size)]
+
+
+def extract_answer(completion_text: str) -> int | None:
+    final = _FINAL_ANSWER_RE.search(completion_text)
+    if final:
+        return int(final.group(1))
+    matches = _ANSWER_RE.findall(completion_text)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+def verify_reward(completion_text: str, gold_answer: int) -> float:
+    """The verifier: a pure function, no learned reward model involved.
+
+    Returns 1.0 for an exact correct answer, 0.1 for producing *some*
+    parseable integer (partial credit for following the format), else 0.0.
+    """
+    predicted = extract_answer(completion_text)
+    if predicted is None:
+        return 0.0
+    if predicted == gold_answer:
+        return 1.0
+    return 0.1
+PYEOF
+
+cat > "$PROJECT_DIR/train_rlvr.py" << 'PYEOF'
 """Minimal RLVR (Reinforcement Learning with Verifiable Rewards) demo.
 
 Algorithm: REINFORCE with a running-mean baseline, applied to a causal
@@ -223,3 +339,132 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+PYEOF
+
+cat > "$PROJECT_DIR/requirements-cluster.txt" << 'REQEOF'
+# For use inside the gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel
+# container on hecate -- that image already bundles a CUDA-matched torch,
+# so we deliberately don't pin/install torch here.
+transformers>=4.44
+datasets>=2.20
+numpy>=1.26
+tqdm>=4.66
+REQEOF
+
+cat > "$PROJECT_DIR/scripts/launch_rlvr.sh" << 'SHEOF'
+#!/bin/bash
+# Runs INSIDE the pyxis/enroot container on the compute node.
+# The container already bundles a CUDA-matched PyTorch, so we don't touch
+# torch here -- only install the lightweight deps train_rlvr.py needs.
+set -e
+
+PROJECT_DIR="/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101"
+
+echo "$(hostname): Installing RLVR dependencies..."
+pip install --quiet -r "$PROJECT_DIR/requirements-cluster.txt"
+
+export HF_HOME="/lustre/fsw/general_sa/bbalakreshna/hf_cache"
+mkdir -p "$HF_HOME"
+
+echo "$(hostname): Launching RLVR training on ${RLVR_NPROC_PER_NODE:-4} GPU(s) (DDP via torchrun)..."
+torchrun --standalone --nproc_per_node="${RLVR_NPROC_PER_NODE:-4}" \
+  "$PROJECT_DIR/train_rlvr.py" \
+  --model "${RLVR_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
+  --iterations "${RLVR_ITERATIONS:-1000}" \
+  --batch-size "${RLVR_BATCH_SIZE:-16}" \
+  --max-new-tokens "${RLVR_MAX_NEW_TOKENS:-64}" \
+  --lr "${RLVR_LR:-1e-5}" \
+  --eval-n "${RLVR_EVAL_N:-50}" \
+  --save-dir "$PROJECT_DIR/out/rlvr-hecate-run1"
+SHEOF
+chmod +x "$PROJECT_DIR/scripts/launch_rlvr.sh"
+
+echo "--- Files written ---"
+ls -la "$PROJECT_DIR" "$PROJECT_DIR/scripts"
+wc -l "$PROJECT_DIR/task.py" "$PROJECT_DIR/train_rlvr.py"
+```
+
+## Block 2 — write and run `submit_hecate.sh`
+
+Writes the job launcher to `$LUSTRE_DIR` (top level, not under the
+project's `scripts/`) and submits it in the background -- training
+output goes to `$PROJECT_DIR/out/hecate_run1.log`, and start/end
+timestamps + total elapsed time are recorded to
+`$PROJECT_DIR/out/hecate_run1.timing` once the job finishes.
+
+```bash
+cat > "$LUSTRE_DIR/submit_hecate.sh" << 'SHEOF'
+#!/bin/bash
+set -e
+
+export ACCOUNT="${ACCOUNT:-general_sa}"
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/$ACCOUNT/$USER}"
+export PROJECT_DIR="${PROJECT_DIR:-$LUSTRE_DIR/rlvr-posttraining101}"
+mkdir -p "$PROJECT_DIR/out"
+
+LOG_FILE="$PROJECT_DIR/out/hecate_run1.log"
+TIMING_FILE="$PROJECT_DIR/out/hecate_run1.timing"
+
+{
+  START_TS=$(date +%s)
+  echo "Job started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TIMING_FILE"
+
+  srun --account=general_sa \
+       --partition=batch-xdr \
+       --nodes=1 \
+       --ntasks-per-node=1 \
+       --time=1:30:00 \
+       --job-name=general_sa-rlvr.qwen15b \
+       --container-image=gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel \
+       --container-mount-home \
+       --container-mounts=/lustre:/lustre \
+       --no-container-remap-root \
+       --mpi=pmix \
+       --export=ALL \
+       "$PROJECT_DIR/scripts/launch_rlvr.sh" > "$LOG_FILE" 2>&1
+
+  END_TS=$(date +%s)
+  ELAPSED=$((END_TS - START_TS))
+  {
+    echo "Job ended: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Elapsed seconds: $ELAPSED"
+    printf "Elapsed (h:m:s): %02d:%02d:%02d\n" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60))
+  } >> "$TIMING_FILE"
+} &
+disown
+
+sleep 2
+squeue -u "$USER"
+echo "Log: $LOG_FILE"
+echo "Timing (written once the job finishes): $TIMING_FILE"
+SHEOF
+chmod +x "$LUSTRE_DIR/submit_hecate.sh"
+
+bash "$LUSTRE_DIR/submit_hecate.sh"
+```
+
+## Checking on it afterward
+
+```bash
+squeue -u $USER
+sacct -u $USER --format=JobID,JobName,State,Elapsed,ExitCode -j <JOBID>
+cat "$PROJECT_DIR/out/hecate_run1.timing"   # start/end timestamps + total elapsed time
+tail -f "$PROJECT_DIR/out/hecate_run1.log"
+```
+
+## Pushing the result to Hugging Face
+
+```bash
+python3 -m venv "$PROJECT_DIR/.venv-upload"
+source "$PROJECT_DIR/.venv-upload/bin/activate"
+
+pip install --quiet -U huggingface_hub
+
+hf auth login   # paste a HF token with "write" scope; input is hidden
+
+hf upload Balab2021/rlvr-qwen2.5-1.5b-instruct \
+  "$PROJECT_DIR/out/rlvr-hecate-run1" \
+  --repo-type model
+
+deactivate
+```

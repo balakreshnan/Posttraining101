@@ -12,11 +12,11 @@ pip install --quiet -r "$PROJECT_DIR/requirements-cluster.txt"
 export HF_HOME="/lustre/fsw/general_sa/bbalakreshna/hf_cache"
 mkdir -p "$HF_HOME"
 
-echo "$(hostname): Launching RLVR training..."
-python "$PROJECT_DIR/train_rlvr.py" \
-  --require-gpu \
+echo "$(hostname): Launching RLVR training on ${RLVR_NPROC_PER_NODE:-4} GPU(s) (DDP via torchrun)..."
+torchrun --standalone --nproc_per_node="${RLVR_NPROC_PER_NODE:-4}" \
+  "$PROJECT_DIR/train_rlvr.py" \
   --model "${RLVR_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}" \
-  --iterations "${RLVR_ITERATIONS:-150}" \
+  --iterations "${RLVR_ITERATIONS:-1000}" \
   --batch-size "${RLVR_BATCH_SIZE:-16}" \
   --max-new-tokens "${RLVR_MAX_NEW_TOKENS:-64}" \
   --lr "${RLVR_LR:-1e-5}" \

@@ -3,11 +3,20 @@
 Validated end-to-end: code + model weights + HF cache all live on Lustre
 at `/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101`, submitted
 from the hecate login node home directory via the account's existing
-`srun --container-image=...` pattern. A 150-step run took ~3 minutes and
-went from 54% -> 100% greedy accuracy on the toy arithmetic task.
+`srun --container-image=...` pattern. A single-GPU 150-step run took ~3
+minutes and went from 54% -> 100% greedy accuracy on the toy arithmetic
+task. `train_rlvr.py` also supports multi-GPU data-parallel training via
+`torchrun` (DDP) -- `launch_rlvr.sh` now launches with
+`--nproc_per_node=4` and 1000 iterations by default.
 
 Nothing here runs automatically — every block below is meant to be
-pasted into your own already-authenticated hecate terminal.
+pasted into your own already-authenticated hecate terminal. This file
+is the narrative walkthrough; for the exact copy-paste `cat`/heredoc
+blocks see:
+- [`executeshell-singlegpu.md`](executeshell-singlegpu.md) — single GPU,
+  150 iterations (the originally validated run)
+- [`executeshell-multigpu.md`](executeshell-multigpu.md) — 4-GPU DDP via
+  `torchrun`, 1000 iterations (current default)
 
 ## 1. Write the code to Lustre
 
@@ -35,34 +44,29 @@ reinstalling torch.
 
 ## 2. Submit the training job
 
-```bash
-nohup srun --account=general_sa \
-     --partition=batch-xdr \
-     --nodes=1 \
-     --ntasks-per-node=1 \
-     --time=1:00:00 \
-     --job-name=general_sa-rlvr.qwen15b \
-     --container-image=gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel \
-     --container-mount-home \
-     --container-mounts=/lustre:/lustre \
-     --no-container-remap-root \
-     --mpi=pmix \
-     --export=ALL \
-     "$PROJECT_DIR/scripts/launch_rlvr.sh" \
-     > "$PROJECT_DIR/out/hecate_run1.log" 2>&1 &
-disown
-```
+Use `submit_hecate.sh` (see [`executeshell-multigpu.md`](executeshell-multigpu.md)
+Block 2 for the exact heredoc that writes and runs it) -- it backgrounds the
+`srun` call so your terminal stays free, and records start/end
+timestamps + total elapsed time to
+`$PROJECT_DIR/out/hecate_run1.timing`. Inside, `launch_rlvr.sh` now
+launches `train_rlvr.py` via `torchrun --nproc_per_node=4` for
+data-parallel (DDP) training across all 4 GPUs on the node, 1000
+iterations by default.
 
-No `--gres=gpu:N` needed — hecate's batch-xdr/batch-spx nodes expose 4
-GPUs per node by default; our single-process job just uses GPU 0.
+No `--gres=gpu:N` needed on the `srun` call — hecate's batch-xdr/batch-spx
+nodes expose 4 GPUs per node by default; `torchrun` claims all 4 for the
+job's single srun task.
 
-Override the run's hyperparameters via env vars before the `srun` line
-(they're read by `launch_rlvr.sh`), e.g.:
+Override the run's hyperparameters via env vars before invoking
+`submit_hecate.sh` (they're read by `launch_rlvr.sh`), e.g.:
 
 ```bash
-RLVR_ITERATIONS=300 RLVR_BATCH_SIZE=32 RLVR_MODEL=Qwen/Qwen2.5-3B-Instruct \
-  nohup srun --account=general_sa ... # (same command as above)
+RLVR_ITERATIONS=2000 RLVR_BATCH_SIZE=32 RLVR_NPROC_PER_NODE=4 RLVR_MODEL=Qwen/Qwen2.5-3B-Instruct \
+  bash "$LUSTRE_DIR/submit_hecate.sh"
 ```
+
+Note `--batch-size` is *per GPU*: with `--nproc_per_node=4` and
+`--batch-size 16`, the effective global batch per step is 64.
 
 ## 3. Check status / view output
 
@@ -79,10 +83,12 @@ tail -f "$PROJECT_DIR/out/hecate_run1.log"
 tail -f /lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101/out/hecate_run1.log
 ```
 
-Look for `Using device: cuda (...)` near the top, `step N/150 | ...`
-progress lines, and `Accuracy after training: ...` / `Saved fine-tuned
-model to ...` at the end. A Python traceback instead of that last line
-means it failed — `sacct`'s ExitCode will be non-zero.
+Look for `Using device: cuda (...) x4 ranks` near the top (only rank 0
+logs), `step N/1000 | ...` progress lines, and `Accuracy after
+training: ...` / `Saved fine-tuned model to ...` at the end. A Python
+traceback instead of that last line means it failed — `sacct`'s ExitCode
+will be non-zero. Total wall-clock time is in
+`$PROJECT_DIR/out/hecate_run1.timing` once the job finishes.
 
 Checkpoint lands at `$PROJECT_DIR/out/rlvr-hecate-run1`; HF model
 downloads are cached under `$LUSTRE_DIR/hf_cache` (via `HF_HOME`, set

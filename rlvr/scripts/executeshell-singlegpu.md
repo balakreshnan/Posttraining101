@@ -1,9 +1,13 @@
-# Hecate execute shell — copy/paste blocks
+# Hecate execute shell — single-GPU (copy/paste blocks)
 
 These are the exact commands used to stand up and run the RLVR sample
-on hecate. Paste each block as-is into your already-authenticated
+on hecate on a **single GPU** (plain `python train_rlvr.py`, no
+`torchrun`/DDP). Validated: 150 iterations, ~3 minutes, 54% -> 100%
+greedy accuracy. Paste each block as-is into your already-authenticated
 hecate terminal, in order. See [`README_cluster.md`](README_cluster.md)
-for the narrative walkthrough (status checks, HF upload, etc).
+for the narrative walkthrough (status checks, HF upload, etc), or
+[`executeshell-multigpu.md`](executeshell-multigpu.md) for the
+4-GPU data-parallel (DDP) version with 1000 iterations.
 
 ## Block 1 — write the RLVR code to Lustre
 
