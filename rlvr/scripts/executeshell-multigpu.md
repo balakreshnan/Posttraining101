@@ -468,3 +468,26 @@ hf upload Balab2021/rlvr-qwen2.5-1.5b-instruct \
 
 deactivate
 ```
+
+## Checking GPU usage for a running job
+
+Replace `509861` with your job's actual ID (from `squeue -u $USER`).
+
+```bash
+# 1. Find which node(s) the job is running on
+scontrol show job 509861 | grep -i nodelist
+# or
+squeue -j 509861
+
+# 2. Attach to the running job's allocation and run nvidia-smi there
+#    (--overlap lets you add a step without stealing the job's resources)
+srun --jobid=509861 --overlap --pty nvidia-smi
+
+# 3. Live-monitoring, refreshing every 2s
+srun --jobid=509861 --overlap --pty watch -n 2 nvidia-smi
+```
+
+With the 4-GPU DDP run you should see 4 `python`/`torchrun` processes,
+one per GPU, each using roughly the same memory as the single-GPU run
+(~18GB for the 1.5B model + AdamW optimizer states), with utilization
+spiking during each step's generate/forward/backward phases.
