@@ -53,7 +53,7 @@ def sample_problem(rng: random.Random, max_operand: int | None = None) -> dict:
     answer = OPS[op](a, b)
     question = _QUESTION_TEMPLATE.format(a=a, op=op, b=b)
     prompt = PROMPT_TEMPLATE.format(a=a, op=op, b=b)
-    return {"question": question, "prompt": prompt, "answer": answer}
+    return {"question": question, "prompt": prompt, "answer": answer, "op": op}
 
 
 def sample_batch(rng: random.Random, batch_size: int, max_operand: int | None = None) -> list[dict]:

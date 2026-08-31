@@ -22,6 +22,9 @@ STEP_RE = re.compile(
 ACCURACY_RE = re.compile(r"greedy accuracy\s*=\s*([\d.]+)%")
 DEVICE_RE = re.compile(r"Using device:\s*(.+)")
 SAVED_RE = re.compile(r"Saved fine-tuned model to (.+)")
+PER_OP_EVAL_RE = re.compile(r"(baseline|final) by operator -- (.+)")
+PER_OP_EVAL_ENTRY_RE = re.compile(r"([+\-*]):\s*([\d.]+)%\s*\((\d+)/(\d+)\)")
+PER_OP_TRAIN_RE = re.compile(r"^\s*([+\-*]):\s*mean_reward=([\d.]+)\s*over\s*(\d+)\s*samples", re.MULTILINE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +97,23 @@ def main() -> None:
     elif accuracies:
         print()
         print(f"-- Greedy-eval accuracy -- only one reading found: {_fmt_pct(accuracies[0])} (run may be incomplete)")
+
+    per_op_train = PER_OP_TRAIN_RE.findall(text)
+    if per_op_train:
+        print()
+        print("-- Training reward by operator (all ranks, all steps) --")
+        for op, mean_reward, count in per_op_train:
+            print(f"  {op}: mean_reward={float(mean_reward):.3f} over {count} samples")
+
+    per_op_evals = PER_OP_EVAL_RE.findall(text)
+    if per_op_evals:
+        print()
+        print("-- Accuracy by operator --")
+        for label, rest in per_op_evals:
+            entries = ", ".join(
+                f"{op}={pct}% ({c}/{t})" for op, pct, c, t in PER_OP_EVAL_ENTRY_RE.findall(rest)
+            )
+            print(f"  {label}: {entries}")
 
     if saved_match:
         print()

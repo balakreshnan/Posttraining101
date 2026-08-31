@@ -26,13 +26,16 @@ Usage:
 import argparse
 import os
 import random
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from task import sample_batch, verify_reward
+from task import OPS, sample_batch, verify_reward
+
+OP_NAMES = list(OPS.keys())
 
 
 def build_prompt(tokenizer, problem: dict) -> str:
@@ -67,8 +70,10 @@ def parse_args() -> argparse.Namespace:
 
 @torch.no_grad()
 def _greedy_eval(model, tokenizer, device, rng, n=20, max_new_tokens=8):
+    """Returns (overall_accuracy, {op: (correct, total)})."""
     problems = sample_batch(rng, n)
     correct = 0
+    per_op = {op: [0, 0] for op in OP_NAMES}  # op -> [correct, total]
     for prob in problems:
         inputs = tokenizer(build_prompt(tokenizer, prob), return_tensors="pt").to(device)
         out = model.generate(
@@ -78,9 +83,22 @@ def _greedy_eval(model, tokenizer, device, rng, n=20, max_new_tokens=8):
             pad_token_id=tokenizer.eos_token_id,
         )
         completion = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        op = prob["op"]
+        per_op[op][1] += 1
         if verify_reward(completion, prob["answer"]) == 1.0:
             correct += 1
-    return correct / n
+            per_op[op][0] += 1
+    per_op_result = {op: (c, t) for op, (c, t) in per_op.items()}
+    return correct / n, per_op_result
+
+
+def _print_per_op_accuracy(label: str, per_op: dict) -> None:
+    parts = []
+    for op in OP_NAMES:
+        correct, total = per_op.get(op, (0, 0))
+        pct = f"{correct / total:.2%}" if total else "n/a"
+        parts.append(f"{op}: {pct} ({correct}/{total})")
+    print(f"  {label} by operator -- " + ", ".join(parts))
 
 
 def main() -> None:
@@ -137,10 +155,17 @@ def main() -> None:
 
     if is_main:
         print("Baseline accuracy before training:")
-        baseline_acc = _greedy_eval(generator, tokenizer, device, rng, n=args.eval_n, max_new_tokens=args.max_new_tokens)
+        baseline_acc, baseline_per_op = _greedy_eval(generator, tokenizer, device, rng, n=args.eval_n, max_new_tokens=args.max_new_tokens)
         print(f"  greedy accuracy = {baseline_acc:.2%}")
+        _print_per_op_accuracy("baseline", baseline_per_op)
     if distributed:
         dist.barrier()
+
+    # Per-operator training reward, accumulated locally on this rank across
+    # all steps -- reduced (summed) across ranks after training so the final
+    # report reflects every GPU's data, not just rank 0's local shard.
+    op_reward_sum = defaultdict(float)
+    op_reward_count = defaultdict(int)
 
     running_baseline = 0.0
     for step in range(1, args.iterations + 1):
@@ -165,7 +190,10 @@ def main() -> None:
         for i, prob in enumerate(problems):
             completion_ids = gen_out[i][prompt_len:]
             completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-            rewards.append(verify_reward(completion_text, prob["answer"]))
+            r = verify_reward(completion_text, prob["answer"])
+            rewards.append(r)
+            op_reward_sum[prob["op"]] += r
+            op_reward_count[prob["op"]] += 1
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
 
         # Running-mean baseline reduces variance of the REINFORCE gradient.
@@ -206,10 +234,25 @@ def main() -> None:
     if distributed:
         dist.barrier()
 
+    # Sum per-operator training reward across all ranks so the report covers
+    # every GPU's data, not just rank 0's local shard.
+    op_sum_t = torch.tensor([op_reward_sum[op] for op in OP_NAMES], dtype=torch.float32, device=device)
+    op_count_t = torch.tensor([op_reward_count[op] for op in OP_NAMES], dtype=torch.float32, device=device)
+    if distributed:
+        dist.reduce(op_sum_t, dst=0)
+        dist.reduce(op_count_t, dst=0)
+
     if is_main:
+        print("\nTraining reward by operator (all ranks, all steps):")
+        for i, op in enumerate(OP_NAMES):
+            count = int(op_count_t[i].item())
+            mean = (op_sum_t[i] / op_count_t[i]).item() if count else float("nan")
+            print(f"  {op}: mean_reward={mean:.3f} over {count} samples")
+
         print("\nAccuracy after training:")
-        final_acc = _greedy_eval(generator, tokenizer, device, rng, n=args.eval_n, max_new_tokens=args.max_new_tokens)
+        final_acc, final_per_op = _greedy_eval(generator, tokenizer, device, rng, n=args.eval_n, max_new_tokens=args.max_new_tokens)
         print(f"  greedy accuracy = {final_acc:.2%} (baseline was {baseline_acc:.2%})")
+        _print_per_op_accuracy("final", final_per_op)
 
         if args.save_dir:
             generator.save_pretrained(args.save_dir)
