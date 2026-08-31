@@ -10,7 +10,7 @@ set -e
 
 export ACCOUNT="${ACCOUNT:-general_sa}"
 export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/$ACCOUNT/$USER}"
-export PROJECT_DIR="${PROJECT_DIR:-$LUSTRE_DIR/rlvr-posttraining101}"
+export PROJECT_DIR="${PROJECT_DIR:-$LUSTRE_DIR}"
 mkdir -p "$PROJECT_DIR/out"
 
 LOG_FILE="$PROJECT_DIR/out/hecate_run1.log"

@@ -66,13 +66,14 @@ Useful flags:
 
 Validated: a single-GPU 150-step run on hecate took ~3 minutes and went
 from 54% to 100% greedy accuracy, with code/weights/HF cache all kept on
-Lustre (`/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101`),
-submitted from the login-node home directory via the account's existing
-`srun --container-image=...` pattern (no Python 3.14 needed there —
-hecate's container already bundles a CUDA-matched PyTorch).
+Lustre, submitted from the login-node home directory via the account's
+existing `srun --container-image=...` pattern (no Python 3.14 needed
+there — hecate's container already bundles a CUDA-matched PyTorch).
 `train_rlvr.py` also supports multi-GPU data-parallel training (DDP) via
 `torchrun`; the hecate scripts now launch with `--nproc_per_node=4` and
-1000 iterations by default to use the full node.
+1000 iterations by default to use the full node. Code/weights live
+directly under `/lustre/fsw/general_sa/bbalakreshna` (`PROJECT_DIR` ==
+`LUSTRE_DIR`) for the multi-GPU setup.
 
 See [`scripts/README_cluster.md`](scripts/README_cluster.md) for the
 full copy-paste command blocks: writing the code to Lustre, submitting

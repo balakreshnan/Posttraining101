@@ -4,7 +4,7 @@
 # -- only install the lightweight deps train_rlvr.py needs on top of it.
 set -e
 
-PROJECT_DIR="/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101"
+PROJECT_DIR="/lustre/fsw/general_sa/bbalakreshna"
 
 echo "$(hostname): Installing RLVR dependencies..."
 pip install --quiet -r "$PROJECT_DIR/requirements-cluster.txt"

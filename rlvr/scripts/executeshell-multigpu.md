@@ -14,13 +14,14 @@ validated single-GPU (150-iteration) version.
 ## Block 1 — write the RLVR code to Lustre
 
 Writes `task.py`, `train_rlvr.py`, `requirements-cluster.txt`, and
-`scripts/launch_rlvr.sh` under
-`/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101`.
+`scripts/launch_rlvr.sh` directly under
+`/lustre/fsw/general_sa/bbalakreshna` (PROJECT_DIR == LUSTRE_DIR, no
+subfolder).
 
 ```bash
 export ACCOUNT="general_sa"
 export LUSTRE_DIR="/lustre/fsw/$ACCOUNT/$USER"
-export PROJECT_DIR="$LUSTRE_DIR/rlvr-posttraining101"
+export PROJECT_DIR="$LUSTRE_DIR"
 mkdir -p "$PROJECT_DIR/scripts" "$PROJECT_DIR/out" "$LUSTRE_DIR/hf_cache"
 
 cat > "$PROJECT_DIR/task.py" << 'PYEOF'
@@ -401,7 +402,7 @@ cat > "$PROJECT_DIR/scripts/launch_rlvr.sh" << 'SHEOF'
 # torch here -- only install the lightweight deps train_rlvr.py needs.
 set -e
 
-PROJECT_DIR="/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101"
+PROJECT_DIR="/lustre/fsw/general_sa/bbalakreshna"
 
 echo "$(hostname): Installing RLVR dependencies..."
 pip install --quiet -r "$PROJECT_DIR/requirements-cluster.txt"
@@ -442,7 +443,7 @@ set -e
 
 export ACCOUNT="${ACCOUNT:-general_sa}"
 export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/$ACCOUNT/$USER}"
-export PROJECT_DIR="${PROJECT_DIR:-$LUSTRE_DIR/rlvr-posttraining101}"
+export PROJECT_DIR="${PROJECT_DIR:-$LUSTRE_DIR}"
 mkdir -p "$PROJECT_DIR/out"
 
 LOG_FILE="$PROJECT_DIR/out/hecate_run1.log"
@@ -545,7 +546,7 @@ node's system `python3` directly -- no venv, no `pip install`, no PEP 668
 issue.
 
 ```bash
-cat > "$PROJECT_DIR/analyze_run.py" << 'PYEOF'
+cat > "$LUSTRE_DIR/analyze_run.py" << 'PYEOF'
 """Summarize an RLVR training run from its log (and optional .timing file).
 
 Parses the step-by-step `step N/M | mean_reward=... | baseline=... | loss=...`
@@ -704,10 +705,10 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-python3 "$PROJECT_DIR/analyze_run.py" "$PROJECT_DIR/out/hecate_run1.log" --timing "$PROJECT_DIR/out/hecate_run1.timing"
+python3 "$LUSTRE_DIR/analyze_run.py" "$LUSTRE_DIR/out/hecate_run1.log" --timing "$LUSTRE_DIR/out/hecate_run1.timing"
 ```
 
-Add `--plot "$PROJECT_DIR/out/hecate_run1.png"` for a reward/loss curve PNG --
+Add `--plot "$LUSTRE_DIR/out/hecate_run1.png"` for a reward/loss curve PNG --
 that flag needs `matplotlib`, which isn't in `requirements-cluster.txt`
 (only needed if you want the plot; install it into the `.venv-upload`
 venv from the Hugging Face upload step above, or a new one, if so).
@@ -725,7 +726,7 @@ needs internet access in whatever browser you open it in (not on the
 cluster).
 
 ```bash
-cat > "$PROJECT_DIR/generate_dashboard.py" << 'PYEOF'
+cat > "$LUSTRE_DIR/generate_dashboard.py" << 'PYEOF'
 """Generate a self-contained interactive HTML dashboard from an RLVR run.
 
 Parses the same log lines as analyze_run.py (step/reward/loss, baseline/
@@ -1055,9 +1056,9 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-python3 "$PROJECT_DIR/generate_dashboard.py" "$PROJECT_DIR/out/hecate_run1.log" \
-  --timing "$PROJECT_DIR/out/hecate_run1.timing" \
-  --output "$PROJECT_DIR/out/hecate_run1_dashboard.html"
+python3 "$LUSTRE_DIR/generate_dashboard.py" "$LUSTRE_DIR/out/hecate_run1.log" \
+  --timing "$LUSTRE_DIR/out/hecate_run1.timing" \
+  --output "$LUSTRE_DIR/out/hecate_run1_dashboard.html"
 ```
 
 Then copy `hecate_run1_dashboard.html` off Lustre (`scp`, or download via the

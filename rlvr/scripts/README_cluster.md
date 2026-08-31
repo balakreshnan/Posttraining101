@@ -1,13 +1,18 @@
 # Running RLVR on hecate (SLURM + pyxis/enroot)
 
-Validated end-to-end: code + model weights + HF cache all live on Lustre
-at `/lustre/fsw/general_sa/bbalakreshna/rlvr-posttraining101`, submitted
-from the hecate login node home directory via the account's existing
-`srun --container-image=...` pattern. A single-GPU 150-step run took ~3
-minutes and went from 54% -> 100% greedy accuracy on the toy arithmetic
-task. `train_rlvr.py` also supports multi-GPU data-parallel training via
-`torchrun` (DDP) -- `launch_rlvr.sh` now launches with
-`--nproc_per_node=4` and 1000 iterations by default.
+Validated end-to-end: code + model weights + HF cache all live on
+Lustre, submitted from the hecate login node home directory via the
+account's existing `srun --container-image=...` pattern. A single-GPU
+150-step run took ~3 minutes and went from 54% -> 100% greedy accuracy
+on the toy arithmetic task. `train_rlvr.py` also supports multi-GPU
+data-parallel training via `torchrun` (DDP) -- `launch_rlvr.sh` now
+launches with `--nproc_per_node=4` and 1000 iterations by default.
+
+`PROJECT_DIR` == `LUSTRE_DIR` (`/lustre/fsw/general_sa/bbalakreshna`,
+flat, no subfolder) as of the multi-GPU setup -- the originally
+validated single-GPU run (`executeshell-singlegpu.md`) used a
+`rlvr-posttraining101` subfolder instead; that snapshot is left as-is
+since it documents exactly what was run.
 
 Nothing here runs automatically — every block below is meant to be
 pasted into your own already-authenticated hecate terminal. This file
