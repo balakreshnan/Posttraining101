@@ -24,8 +24,22 @@ spreads the frozen base across every visible GPU on the node):
     python train_rlvr_qwen38.py --iterations 10 --batch-size 2
 
 Defaults are intentionally tiny (batch 2, 10 iterations, 32 new tokens).
-This is unverified against real hardware -- start small, confirm it
-loads and completes a few steps, then scale up cautiously.
+
+Confirmed on real hardware: model load + LoRA attach works (144-file
+fetch, weight load, "trainable params: 5.7M / 177.4B" as expected).
+First attempt (lr=1e-4, top_k=0, double-quant on) hit a CUDA device-side
+assert ("probability tensor contains inf, nan or element < 0") inside
+model.generate()'s sampling, 2 steps in -- almost certainly 4-bit
+quantization interacting with this architecture's more exotic layers
+(Gated DeltaNet / sparse attention / MoE) once the LoRA delta shifted
+the forward pass. Once that assert fires the CUDA context is corrupted;
+there's no recovering within the same process, only preventing it.
+Mitigations applied here: lr dropped to 5e-6, max_grad_norm to 0.3,
+double quantization disabled, sampling switched to the model card's own
+recommended top_p/top_k instead of unrestricted top_k=0, plus an
+isfinite() guard around our own forward pass's logits/loss (skips that
+step's update rather than propagating NaN gradients -- note this guard
+can't catch a crash inside generate() itself, only in our own forward).
 """
 
 import argparse
@@ -56,8 +70,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--max-new-tokens", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-4, help="LoRA adapters use a higher LR than full fine-tuning")
-    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument(
+        "--lr", type=float, default=5e-6,
+        help="Kept conservative (much lower than typical LoRA LRs) -- this base model is "
+             "brand-new/exotic under 4-bit quantization and showed NaN logits after just "
+             "one update at 1e-4. Only raise this once a run has completed cleanly.",
+    )
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top-p", type=float, default=0.8)
+    p.add_argument(
+        "--top-k", type=int, default=20,
+        help="Qwen3.8-Flash-Next's model card recommends top_k=20 for both thinking and "
+             "instruct modes -- top_k=0 (unrestricted) is more likely to sample a token "
+             "from the distribution's unstable tail under 4-bit quantization.",
+    )
+    p.add_argument(
+        "--max-grad-norm", type=float, default=0.3,
+        help="Tighter than train_rlvr.py's 1.0 -- same rationale as --lr.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-dir", default=None, help="Optional dir to save the LoRA adapter (not the full base model)")
     p.add_argument("--log-every", type=int, default=1)
@@ -111,7 +141,10 @@ def main() -> None:
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
+        # Double quantization adds a second layer of approximation on top of an
+        # already-aggressive 4-bit format; disabled to reduce numerical error on
+        # this untested-at-4-bit architecture (NaN logits appeared with it on).
+        bnb_4bit_use_double_quant=False,
     )
 
     processor = AutoProcessor.from_pretrained(args.model)
@@ -160,7 +193,8 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 do_sample=True,
                 temperature=args.temperature,
-                top_k=0,
+                top_p=args.top_p,
+                top_k=args.top_k,
                 pad_token_id=processor.tokenizer.eos_token_id,
             )
 
@@ -177,6 +211,11 @@ def main() -> None:
 
         attention_mask = (gen_out != processor.tokenizer.pad_token_id).long()
         logits = model(input_ids=gen_out, attention_mask=attention_mask).logits
+        if not torch.isfinite(logits).all():
+            print(f"step {step:3d}: non-finite logits from the base model forward pass -- "
+                  f"skipping this step's update (this indicates the quantized base itself "
+                  f"produced NaN/inf, independent of our loss code).")
+            continue
         log_probs = torch.log_softmax(logits[:, :-1, :].float(), dim=-1)
         target_ids = gen_out[:, 1:]
         token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
@@ -188,9 +227,13 @@ def main() -> None:
         seq_log_prob = (token_log_probs * gen_mask).sum(dim=1) / gen_mask.sum(dim=1).clamp(min=1)
         loss = -(advantages.to(seq_log_prob.device) * seq_log_prob).mean()
 
+        if not torch.isfinite(loss):
+            print(f"step {step:3d}: non-finite loss -- skipping this step's optimizer update.")
+            continue
+
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
         optimizer.step()
 
         if step % args.log_every == 0:

@@ -19,7 +19,7 @@ python "$LUSTRE_DIR/train_rlvr_qwen38.py" \
   --iterations "${RLVR_ITERATIONS:-10}" \
   --batch-size "${RLVR_BATCH_SIZE:-2}" \
   --max-new-tokens "${RLVR_MAX_NEW_TOKENS:-32}" \
-  --lr "${RLVR_LR:-1e-4}" \
+  --lr "${RLVR_LR:-5e-6}" \
   --eval-n "${RLVR_EVAL_N:-6}" \
   --lora-r "${RLVR_LORA_R:-16}" \
   --save-dir "$LUSTRE_DIR/out/rlvr-qwen38-run1"
