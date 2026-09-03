@@ -1,0 +1,213 @@
+"""RLVR fine-tuning for Qwen/Qwen3.8-Flash-Next -- EXPERIMENTAL.
+
+This is a fundamentally different setup from train_rlvr.py, required
+because Qwen3.8-Flash-Next is:
+  - ~180B params (125B dense + 51B n-gram embedding + 4B MTP, ~6B
+    activated per token via MoE). Full BF16 weights are ~360GB -- this
+    will NOT fit as 4 full replicas the way train_rlvr.py's DDP setup
+    works. Instead we load the frozen base in 4-bit (bitsandbytes) with
+    device_map="auto" so accelerate shards it across all visible GPUs,
+    and only train a small LoRA adapter (peft) on top -- the only
+    thing that needs gradients/optimizer state.
+  - Multimodal (image-text-to-text): loaded via AutoProcessor +
+    AutoModelForImageTextToText, not AutoTokenizer + AutoModelForCausalLM.
+    We only use its text path here (no images), same arithmetic task as
+    train_rlvr.py, reusing task.py unchanged.
+  - A brand-new architecture (qwen4_exp / Qwen4ExpForConditionalGeneration)
+    -- requires a very recent `transformers` (see requirements-qwen38.txt).
+    If loading fails with an unrecognized-architecture error, upgrade
+    transformers first: pip install -U transformers
+
+Run as a single process (no torchrun/DDP -- device_map="auto" already
+spreads the frozen base across every visible GPU on the node):
+
+    python train_rlvr_qwen38.py --iterations 10 --batch-size 2
+
+Defaults are intentionally tiny (batch 2, 10 iterations, 32 new tokens).
+This is unverified against real hardware -- start small, confirm it
+loads and completes a few steps, then scale up cautiously.
+"""
+
+import argparse
+import random
+
+import torch
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+
+from task import sample_batch, verify_reward
+
+try:
+    from peft import LoraConfig, get_peft_model
+except ImportError as e:
+    raise SystemExit(
+        "peft is required for this script. "
+        "pip install -r requirements-qwen38.txt first."
+    ) from e
+
+
+def build_prompt(processor, problem: dict) -> str:
+    messages = [{"role": "user", "content": problem["question"]}]
+    return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Experimental RLVR fine-tuning for Qwen3.8-Flash-Next")
+    p.add_argument("--model", default="Qwen/Qwen3.8-Flash-Next")
+    p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--max-new-tokens", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-4, help="LoRA adapters use a higher LR than full fine-tuning")
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--save-dir", default=None, help="Optional dir to save the LoRA adapter (not the full base model)")
+    p.add_argument("--log-every", type=int, default=1)
+    p.add_argument("--eval-n", type=int, default=6, help="Held-out problems for greedy eval -- keep small, this model is slow")
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=32)
+    p.add_argument(
+        "--lora-target-modules",
+        default="q_proj,k_proj,v_proj,o_proj",
+        help="Comma-separated module name suffixes to attach LoRA to. Kept to attention "
+             "projections by default -- the 512-expert MoE layers are left frozen; "
+             "adapting attention alone is usually enough to shift behavior for RLVR "
+             "and keeps adapter size (and load complexity) sane.",
+    )
+    return p.parse_args()
+
+
+@torch.no_grad()
+def _greedy_eval(model, processor, rng, n, max_new_tokens):
+    problems = sample_batch(rng, n)
+    correct = 0
+    for prob in problems:
+        text = build_prompt(processor, prob)
+        inputs = processor(text=text, return_tensors="pt").to(model.device)
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=processor.tokenizer.eos_token_id,
+        )
+        completion = processor.tokenizer.decode(
+            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+        if verify_reward(completion, prob["answer"]) == 1.0:
+            correct += 1
+    return correct / n
+
+
+def main() -> None:
+    args = parse_args()
+    rng = random.Random(args.seed)
+    torch.manual_seed(args.seed)
+
+    if not torch.cuda.is_available():
+        raise SystemExit("This script requires CUDA GPUs -- Qwen3.8-Flash-Next is not viable on CPU.")
+
+    print(f"Loading {args.model} in 4-bit, sharded across {torch.cuda.device_count()} visible GPU(s)...")
+    print("This is a ~180B param model -- expect this step alone to take a while.")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+
+    processor = AutoProcessor.from_pretrained(args.model)
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    processor.tokenizer.padding_side = "left"
+
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+    model.config.use_cache = False  # required during training
+
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=[m.strip() for m in args.lora_target_modules.split(",")],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+    model.train()
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+
+    print("Baseline accuracy before training:")
+    baseline_acc = _greedy_eval(model, processor, rng, n=args.eval_n, max_new_tokens=args.max_new_tokens)
+    print(f"  greedy accuracy = {baseline_acc:.2%}")
+
+    running_baseline = 0.0
+    for step in range(1, args.iterations + 1):
+        problems = sample_batch(rng, args.batch_size)
+        prompts = [build_prompt(processor, p) for p in problems]
+
+        enc = processor(text=prompts, return_tensors="pt", padding=True).to(model.device)
+        prompt_len = enc["input_ids"].shape[1]
+
+        with torch.no_grad():
+            gen_out = model.generate(
+                **enc,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=True,
+                temperature=args.temperature,
+                top_k=0,
+                pad_token_id=processor.tokenizer.eos_token_id,
+            )
+
+        rewards = []
+        for i, prob in enumerate(problems):
+            completion_ids = gen_out[i][prompt_len:]
+            completion_text = processor.tokenizer.decode(completion_ids, skip_special_tokens=True)
+            rewards.append(verify_reward(completion_text, prob["answer"]))
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=gen_out.device)
+
+        batch_mean = rewards_t.mean().item()
+        advantages = rewards_t - running_baseline
+        running_baseline = 0.9 * running_baseline + 0.1 * batch_mean
+
+        attention_mask = (gen_out != processor.tokenizer.pad_token_id).long()
+        logits = model(input_ids=gen_out, attention_mask=attention_mask).logits
+        log_probs = torch.log_softmax(logits[:, :-1, :].float(), dim=-1)
+        target_ids = gen_out[:, 1:]
+        token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+
+        gen_mask = torch.zeros_like(target_ids, dtype=torch.float32)
+        gen_mask[:, prompt_len - 1:] = 1.0
+        gen_mask *= attention_mask[:, 1:].float()
+
+        seq_log_prob = (token_log_probs * gen_mask).sum(dim=1) / gen_mask.sum(dim=1).clamp(min=1)
+        loss = -(advantages.to(seq_log_prob.device) * seq_log_prob).mean()
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        optimizer.step()
+
+        if step % args.log_every == 0:
+            print(
+                f"step {step:3d}/{args.iterations} | "
+                f"mean_reward={batch_mean:.3f} | baseline={running_baseline:.3f} | loss={loss.item():.4f}"
+            )
+
+    print("\nAccuracy after training:")
+    final_acc = _greedy_eval(model, processor, rng, n=args.eval_n, max_new_tokens=args.max_new_tokens)
+    print(f"  greedy accuracy = {final_acc:.2%} (baseline was {baseline_acc:.2%})")
+
+    if args.save_dir:
+        model.save_pretrained(args.save_dir)  # LoRA adapter only, not the frozen base
+        processor.save_pretrained(args.save_dir)
+        print(f"Saved LoRA adapter to {args.save_dir}")
+
+
+if __name__ == "__main__":
+    main()

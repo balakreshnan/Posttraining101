@@ -1,0 +1,9 @@
+# For train_rlvr_qwen38.py inside the gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel
+# container. The container's bundled torch/CUDA is reused (not reinstalled here), but
+# Qwen3.8-Flash-Next's architecture (qwen4_exp) is brand new -- if model loading fails
+# with an unrecognized-architecture error, the container's transformers is too old;
+# try `pip install -U transformers` (or install from git main) before anything else.
+transformers>=4.57
+accelerate>=1.0
+peft>=0.13
+bitsandbytes>=0.44

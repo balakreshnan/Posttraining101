@@ -22,6 +22,10 @@ blocks see:
   150 iterations (the originally validated run)
 - [`executeshell-multigpu.md`](executeshell-multigpu.md) — 4-GPU DDP via
   `torchrun`, 1000 iterations (current default)
+- [`executeshell-qwen38.md`](executeshell-qwen38.md) — **experimental**,
+  unverified: LoRA fine-tuning of the ~180B param multimodal
+  Qwen3.8-Flash-Next via 4-bit quantization + `device_map="auto"`
+  (not DDP -- the model doesn't fit as full replicas)
 
 ## 1. Write the code to Lustre
 
