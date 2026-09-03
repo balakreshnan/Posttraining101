@@ -20,7 +20,7 @@ TIMING_FILE="$LUSTRE_DIR/out/hecate_qwen38_run1.timing"
        --partition=batch-xdr \
        --nodes=1 \
        --ntasks-per-node=1 \
-       --time=4:00:00 \
+       --time=5:00:00 \
        --job-name=general_sa-rlvr.qwen38 \
        --container-image=gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel \
        --container-mount-home \

@@ -1,23 +1,26 @@
 # Hecate execute shell — Qwen3.8-Flash-Next RLVR (EXPERIMENTAL)
 
-**This is unverified against real hardware.** Qwen3.8-Flash-Next is a
-~180B param multimodal MoE model (see model card:
+**Experimental -- four runs on hecate so far, each one taught us
+something; see "Known risks" at the bottom for the full story.**
+Qwen3.8-Flash-Next is a ~180B param multimodal MoE model (model card:
 [huggingface.co/Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)) --
 fundamentally different from the validated [`executeshell-multigpu.md`](executeshell-multigpu.md)
 / [`executeshell-singlegpu.md`](executeshell-singlegpu.md) flows, which
-use Qwen2.5-1.5B-Instruct with full-replica DDP training. At 180B params
-(~360GB in BF16), that approach doesn't fit this model at all -- instead
-this loads the frozen base in 4-bit (bitsandbytes) with
-`device_map="auto"` (sharded across every visible GPU on the node) and
-trains only a small LoRA adapter on top of the attention projections.
-The 512-expert MoE layers stay frozen.
+use Qwen2.5-1.5B-Instruct with full-replica DDP training. At ~360GB in
+BF16 it cannot be replicated per GPU -- instead the frozen base is
+sharded across all visible GPUs with `device_map="auto"` (balanced via
+`max_memory` so every GPU holds a slice; hecate's Vera Rubin nodes have
+~280GB per GPU, so it fits in plain bf16 -- no quantisation) and only a
+small LoRA adapter on the attention projections is trained. The
+512-expert MoE layers stay frozen.
 
 Read [train_rlvr_qwen38.py](../train_rlvr_qwen38.py)'s docstring for the
-full rationale and for what has actually been observed on hecate so far.
-Start with the tiny defaults (batch 1, 10 iterations, 64 tokens, thinking
-mode off) baked into `launch_rlvr_qwen38.sh` -- this run is instrumented
-to *diagnose* the recurring NaN crash (see "Known risks" at the bottom),
-not to be a real training run yet.
+rationale behind every default. The important ones: `--batch-size 1`
+(left-padding into the recurrent layers caused a hard crash -- use
+`--grad-accum` for a real batch), thinking mode off, gradient and
+parameter guards that skip/roll back a bad step instead of poisoning the
+adapter. Start with the defaults in `launch_rlvr_qwen38.sh` (10 steps x
+4 accumulated rollouts) and read the printed completions before scaling.
 
 ## 1. Download the model weights
 
@@ -85,65 +88,63 @@ cat > "$LUSTRE_DIR/train_rlvr_qwen38.py" << 'PYEOF'
 This is a fundamentally different setup from train_rlvr.py, required
 because Qwen3.8-Flash-Next is:
   - ~180B params (125B dense + 51B n-gram embedding + 4B MTP, ~6B
-    activated per token via MoE). Full BF16 weights are ~360GB -- this
-    will NOT fit as 4 full replicas the way train_rlvr.py's DDP setup
-    works. Instead we load the frozen base in 4-bit (bitsandbytes) with
-    device_map="auto" so accelerate shards it across all visible GPUs,
-    and only train a small LoRA adapter (peft) on top -- the only
-    thing that needs gradients/optimizer state.
-  - Multimodal (image-text-to-text): loaded via AutoProcessor +
-    AutoModelForImageTextToText, not AutoTokenizer + AutoModelForCausalLM.
-    We only use its text path here (no images), same arithmetic task as
-    train_rlvr.py, reusing task.py unchanged.
-  - A "thinking" model: by default it emits <think>...</think> before
-    the answer. With a small --max-new-tokens budget it never reaches
-    the answer, which scores 0.0/0.1 every time. We render the chat
-    template with enable_thinking=False (documented on the model card).
+    activated per token via MoE) -- ~360GB in BF16. It cannot be
+    replicated per-GPU the way train_rlvr.py's DDP setup works. Instead
+    the frozen base is sharded across all visible GPUs with
+    device_map="auto" (balanced via max_memory so every GPU holds a
+    slice) and only a small LoRA adapter (peft) is trained.
+  - Multimodal (image-text-to-text): AutoProcessor +
+    AutoModelForImageTextToText, text path only, same arithmetic task as
+    train_rlvr.py (task.py reused unchanged).
+  - A "thinking" model: it emits <think>...</think> by default, which
+    eats a small --max-new-tokens budget before any answer appears. The
+    chat template is rendered with enable_thinking=False.
 
-Run as a single process (no torchrun/DDP -- device_map="auto" already
-spreads the frozen base across every visible GPU on the node):
+Run as a single process (no torchrun/DDP):
 
-    python train_rlvr_qwen38.py --iterations 10 --batch-size 1
+    python train_rlvr_qwen38.py --iterations 10
 
-What has actually been observed on hecate so far (3 runs):
-  - Model load + LoRA attach work every time
-    ("trainable params: 5,701,632 || all params: 177,398,532,208").
-  - Baseline greedy accuracy 0.00% and every sampled rollout scoring
-    exactly 0.1 -- consistent with thinking mode eating the whole
-    token budget (see above), NOT with the prompt being malformed.
-  - An identical CUDA device-side assert ("probability tensor contains
-    either inf, nan or element < 0") inside model.generate() at step 3
-    on all three runs, with lr varying 20x between runs. LoRA's B
-    matrix is zero-initialised, so two tiny steps in the model is still
-    ~the base model: this is not an update-magnitude problem. Because
-    both the problem RNG and torch RNG are seeded, "step 3" is really
-    "one specific batch of inputs" -- the NaN is data-dependent. Once
-    the assert fires the CUDA context is dead; the process can't
-    recover, only avoid it.
+What has been learned on hecate (4 runs), in the order it was learned:
+  1. Runs 1-3 (batch 2, 4-bit): identical CUDA assert ("probability
+     tensor contains inf/nan") inside generate() at step 3, independent
+     of lr. Run 4 with --batch-size 1 got through 135 real steps ->
+     LEFT-PADDING INTO THE RECURRENT GATED-DELTANET LAYERS WAS THAT
+     CRASH. Batch size stays 1; use --grad-accum for a real batch.
+  2. enable_thinking=False took baseline accuracy from 0% to non-zero.
+  3. Run 4 then went to NaN on EVERY input after ~step 135 (886 of
+     1000 steps skipped by the finite-logits guard; final eval 20/20
+     non-finite). A model that works for 135 steps and is then broken
+     on all inputs means THE LORA WEIGHTS WERE POISONED: one step had a
+     non-finite gradient (a finite loss does not guarantee finite
+     grads), clip_grad_norm_ turned an inf norm into NaN grads
+     (inf * 0), optimizer.step() wrote NaN into the adapter and AdamW's
+     moments, and nothing could recover. The previous guard checked
+     logits and loss but never gradients or parameters.
+  4. nvidia-smi showed the "4-bit" model occupying ~436GB across two
+     GPUs (the other two empty): bitsandbytes only quantises nn.Linear,
+     and this architecture's fused MoE expert tensors and 51B n-gram
+     nn.Embedding are not that -- so the model was mostly bf16 with a
+     scattering of NF4 layers. These GPUs have ~280GB each; the whole
+     model fits in bf16 across four of them. Quantisation is therefore
+     off by default (--quant none) and layers are spread over all GPUs.
 
-This version is therefore instrumented to *diagnose* rather than guess:
-  - --list-modules: builds the model on the meta device (seconds, no
-    weights) and prints every module name pattern, so quantisation
-    skip-lists and LoRA target names can be chosen from real names.
-  - Prints the rendered prompt once and the first decoded completion of
-    every eval / training step, so we can see what the model says.
-  - Runs a plain forward pass on each prompt batch and checks the
-    logits are finite BEFORE calling generate(). If they aren't, it
-    prints the offending prompt and skips the step -- no multinomial
-    call, so no CUDA assert, and the run keeps going.
-  - --skip-quant-modules: comma-separated substrings; matching
-    nn.Linear modules are kept in bf16 instead of 4-bit (resolved to
-    full module names via the meta model, so it works regardless of
-    transformers' name-matching rules).
-  - Default --batch-size 1 removes padding as a variable (this
-    architecture has recurrent Gated DeltaNet layers; left-padding
-    feeding a recurrence is a plausible NaN source). Raise it once a
-    run completes.
-  - Set CUDA_LAUNCH_BLOCKING=1 in the environment (launch_rlvr_qwen38.sh
-    does) so any remaining assert reports the *real* failing op instead
-    of the async-reported one.
-  - Try a different --seed: if the crash moves or disappears, that
-    confirms it is input-dependent.
+What this version does about it:
+  - Gradient guard: clip_grad_norm_ returns the total norm; if it is
+    not finite the grads are zeroed and the step is skipped BEFORE
+    optimizer.step(). (The clip coefficient inf*0=NaN path can no
+    longer reach the weights.)
+  - Parameter rollback: a copy of the trainable (LoRA-only, ~5.7M
+    params, ~23MB) weights is kept; after every optimizer.step() the
+    params are checked and, if any are non-finite, restored from the
+    copy and the optimizer state is rebuilt. A bad step costs one
+    step, not the run.
+  - --grad-accum N: N single-prompt rollouts per optimizer step, losses
+    accumulated. Effective batch N with zero padding.
+  - --quant none|4bit (default none) and --max-memory-per-gpu to balance
+    the shards across all visible GPUs.
+  - Everything from the diagnostic version is kept: finite-logits check
+    before generate(), printed prompt/completions, --list-modules,
+    --skip-quant-modules, --seed, non-finite bookkeeping.
 """
 
 import argparse
@@ -175,8 +176,6 @@ except ImportError as e:
 
 
 def build_prompt(processor, problem: dict, enable_thinking: bool) -> str:
-    # Structured content blocks -- this is a multimodal processor and the
-    # model card's examples use [{"type": "text", "text": ...}] throughout.
     messages = [{"role": "user", "content": [{"type": "text", "text": problem["question"]}]}]
     return processor.apply_chat_template(
         messages,
@@ -189,62 +188,63 @@ def build_prompt(processor, problem: dict, enable_thinking: bool) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Experimental RLVR fine-tuning for Qwen3.8-Flash-Next")
     p.add_argument("--model", default="Qwen/Qwen3.8-Flash-Next")
-    p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--iterations", type=int, default=10, help="Optimizer steps.")
     p.add_argument(
         "--batch-size", type=int, default=1,
-        help="Default 1 = no padding, removing it as a variable while diagnosing the NaN "
-             "crash (recurrent layers + left-padding is a plausible cause). Raise once a "
-             "run completes.",
+        help="Prompts per rollout. KEEP AT 1: batch>1 requires left-padding, which drove the "
+             "recurrent Gated DeltaNet layers to NaN and crashed generate() at step 3 on "
+             "three consecutive runs. Use --grad-accum for a larger effective batch.",
     )
     p.add_argument(
-        "--max-new-tokens", type=int, default=64,
-        help="With thinking disabled, 64 is plenty for 'Final Answer: N'. If you enable "
-             "thinking you'll need hundreds.",
+        "--grad-accum", type=int, default=4,
+        help="Single-prompt rollouts accumulated per optimizer step. Effective batch = "
+             "--batch-size x --grad-accum, with no padding.",
     )
+    p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument(
         "--enable-thinking", action="store_true",
-        help="Render the chat template with thinking ON (model default). Off by default "
-             "here because the <think> block otherwise consumes the whole token budget.",
+        help="Render the chat template with thinking ON (model default). Off by default; "
+             "turning it off is what moved baseline accuracy from 0% to non-zero.",
     )
-    p.add_argument(
-        "--lr", type=float, default=5e-6,
-        help="Kept conservative. Note the NaN crash was NOT lr-dependent (identical at "
-             "1e-4 and 5e-6), so don't expect lowering this further to fix it.",
-    )
+    p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=20, help="Model card's recommended value.")
     p.add_argument("--max-grad-norm", type=float, default=0.3)
-    p.add_argument(
-        "--seed", type=int, default=0,
-        help="Both the problem RNG and torch are seeded from this. The NaN crash has "
-             "been at the same step every run -- change the seed to test whether it is "
-             "tied to specific inputs.",
-    )
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-dir", default=None, help="Optional dir to save the LoRA adapter (not the full base model)")
     p.add_argument("--log-every", type=int, default=1)
-    p.add_argument("--eval-n", type=int, default=6, help="Held-out problems for greedy eval -- keep small, this model is slow")
+    p.add_argument("--eval-n", type=int, default=6, help="Held-out problems for greedy eval -- this model is slow")
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument(
         "--lora-target-modules",
         default="q_proj,k_proj,v_proj,o_proj",
-        help="Comma-separated module name suffixes to attach LoRA to. Attention "
-             "projections only by default -- the 512-expert MoE layers stay frozen. "
-             "Use --list-modules to see the real names in this architecture.",
+        help="Comma-separated module name suffixes for LoRA. Attention projections only; "
+             "the 512-expert MoE stays frozen. --list-modules shows real names.",
+    )
+    p.add_argument(
+        "--quant", choices=["none", "4bit"], default="none",
+        help="'none' loads bf16 (fits: ~360GB across four ~280GB GPUs). '4bit' uses "
+             "bitsandbytes NF4 -- on this architecture it only reaches a few nn.Linear "
+             "layers (fused MoE experts and the n-gram nn.Embedding are untouched), so it "
+             "saves little memory and is a NaN suspect. Kept for experiments only.",
+    )
+    p.add_argument(
+        "--max-memory-per-gpu", default="200GiB",
+        help="Cap passed to device_map='auto' per GPU so the shards are spread across ALL "
+             "visible GPUs instead of filling GPU 0 to 98%% and leaving others empty "
+             "(what run 4 did). Leave headroom for activations.",
     )
     p.add_argument(
         "--skip-quant-modules", default="",
-        help="Comma-separated substrings; any nn.Linear whose full name contains one is "
-             "kept in bf16 rather than quantised to 4-bit. lm_head is always skipped. "
-             "Candidates once --list-modules shows real names: MoE routers/gates, the "
-             "sparse-attention indexer, Gated DeltaNet's small gate projections, MTP.",
+        help="With --quant 4bit: comma-separated substrings; matching nn.Linear modules stay "
+             "in bf16. Ignored for --quant none.",
     )
     p.add_argument(
         "--list-modules", action="store_true",
         help="Build the model on the meta device (no weights, seconds), print module "
-             "name patterns grouped by class, and exit. Use this to pick "
-             "--skip-quant-modules / --lora-target-modules from real names.",
+             "name patterns grouped by class, and exit.",
     )
     p.add_argument("--print-completion-chars", type=int, default=200)
     return p.parse_args()
@@ -275,19 +275,16 @@ def list_modules(model_name: str) -> None:
     print(f"{len(seen)} distinct module patterns in {model_name}:\n")
     for (cls, pattern), extra in sorted(seen.items(), key=lambda kv: kv[0][1]):
         print(f"  {cls:40s} {pattern}{extra}")
-    print("\nnn.Linear modules are the ones bitsandbytes will quantise unless skipped.")
 
 
 def resolve_skip_modules(model_name: str, substrings: list[str]) -> list[str]:
-    """Turn substrings into the exact full names of matching nn.Linear modules."""
     if not substrings:
         return []
     model = _meta_model(model_name)
-    names = [
+    return [
         name for name, module in model.named_modules()
         if isinstance(module, torch.nn.Linear) and any(s in name for s in substrings)
     ]
-    return names
 
 
 def _decode_completion(processor, out_ids, prompt_len):
@@ -301,28 +298,28 @@ def _show(label: str, text: str, limit: int) -> None:
 
 @torch.no_grad()
 def _logits_finite(model, enc) -> bool:
-    """One plain forward over the prompt. If this is non-finite the base model
-    itself is broken for this input -- generate() would hit the CUDA assert."""
-    logits = model(**enc).logits
-    return bool(torch.isfinite(logits).all())
+    """Plain forward over the prompt. Non-finite here means the model itself is
+    broken for this input -- generate() would hit the CUDA assert."""
+    return bool(torch.isfinite(model(**enc).logits).all())
 
 
 @torch.no_grad()
 def _greedy_eval(model, processor, rng, n, max_new_tokens, enable_thinking, show_chars):
     problems = sample_batch(rng, n)
     correct = 0
+    nonfinite = 0
     for i, prob in enumerate(problems):
         text = build_prompt(processor, prob, enable_thinking)
         inputs = processor(text=text, return_tensors="pt").to(model.device)
         if not _logits_finite(model, inputs):
+            nonfinite += 1
             print(f"  eval problem {i}: NON-FINITE logits for prompt {prob['question']!r} -- skipping")
             continue
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            use_cache=True,  # config.use_cache=False is set for the training forward;
-                              # generation (esp. the recurrent DeltaNet layers) wants it on
+            use_cache=True,
             pad_token_id=processor.tokenizer.eos_token_id,
         )
         completion = _decode_completion(processor, out[0], inputs["input_ids"].shape[1])
@@ -331,7 +328,23 @@ def _greedy_eval(model, processor, rng, n, max_new_tokens, enable_thinking, show
             _show(f"eval sample (gold={prob['answer']}, reward={reward})", completion, show_chars)
         if reward == 1.0:
             correct += 1
+    if nonfinite:
+        print(f"  {nonfinite}/{n} eval prompts produced non-finite logits")
     return correct / n
+
+
+def _snapshot(params):
+    return [p.detach().clone() for p in params]
+
+
+def _params_finite(params) -> bool:
+    return all(bool(torch.isfinite(p).all()) for p in params)
+
+
+@torch.no_grad()
+def _restore(params, snapshot):
+    for p, s in zip(params, snapshot):
+        p.copy_(s)
 
 
 def main() -> None:
@@ -345,30 +358,27 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     if not torch.cuda.is_available():
-        raise SystemExit("This script requires CUDA GPUs -- Qwen3.8-Flash-Next is not viable on CPU.")
-    if os.environ.get("CUDA_LAUNCH_BLOCKING") != "1":
-        print("note: CUDA_LAUNCH_BLOCKING is not set -- if a CUDA assert fires, the reported "
-              "stack trace will point at the wrong op. launch_rlvr_qwen38.sh sets it.")
+        raise SystemExit("This script requires CUDA GPUs.")
+    n_gpu = torch.cuda.device_count()
 
-    skip_substrings = [s.strip() for s in args.skip_quant_modules.split(",") if s.strip()]
-    skip_names = resolve_skip_modules(args.model, skip_substrings)
-    if skip_substrings:
-        print(f"Keeping {len(skip_names)} nn.Linear module(s) in bf16 (matched {skip_substrings}).")
-        for name in skip_names[:10]:
-            print(f"    {name}")
-        if len(skip_names) > 10:
-            print(f"    ... and {len(skip_names) - 10} more")
+    quantization_config = None
+    if args.quant == "4bit":
+        skip_substrings = [s.strip() for s in args.skip_quant_modules.split(",") if s.strip()]
+        skip_names = resolve_skip_modules(args.model, skip_substrings)
+        if skip_substrings:
+            print(f"Keeping {len(skip_names)} nn.Linear module(s) in bf16 (matched {skip_substrings}).")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=False,
+            llm_int8_skip_modules=["lm_head", *skip_names],
+        )
 
-    print(f"Loading {args.model} in 4-bit, sharded across {torch.cuda.device_count()} visible GPU(s)...")
-    print("This is a ~180B param model -- expect this step alone to take a while.")
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=False,
-        llm_int8_skip_modules=["lm_head", *skip_names],
-    )
+    max_memory = {i: args.max_memory_per_gpu for i in range(n_gpu)}
+    print(f"Loading {args.model} ({'bf16' if quantization_config is None else '4-bit NF4'}), "
+          f"sharded across {n_gpu} GPU(s) at up to {args.max_memory_per_gpu} each...")
+    print("~180B params -- expect this step alone to take a few minutes.")
 
     processor = AutoProcessor.from_pretrained(args.model)
     if processor.tokenizer.pad_token is None:
@@ -377,31 +387,42 @@ def main() -> None:
 
     model = AutoModelForImageTextToText.from_pretrained(
         args.model,
-        quantization_config=bnb_config,
+        quantization_config=quantization_config,
         device_map="auto",
+        max_memory=max_memory,
         dtype=torch.bfloat16,
     )
-    model.config.use_cache = False  # for the training forward pass; generate() overrides
+    model.config.use_cache = False  # training forward; generate() passes use_cache=True
+
+    # Where did the shards land? (run 4 put everything on GPUs 0-1.)
+    placement = {}
+    for _, dev in getattr(model, "hf_device_map", {}).items():
+        placement[str(dev)] = placement.get(str(dev), 0) + 1
+    print(f"Device map (modules per device): {placement}")
+    for i in range(n_gpu):
+        used = torch.cuda.memory_allocated(i) / 2**30
+        print(f"  GPU {i}: {used:.1f} GiB allocated after load")
 
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         target_modules=[m.strip() for m in args.lora_target_modules.split(",")],
-        # 0.0 so the log-probs computed in the training forward match the distribution
-        # that produced the sampled tokens in generate(); the model also stays in eval()
-        # mode throughout for the same reason (gradients still flow in eval()).
-        lora_dropout=0.0,
+        lora_dropout=0.0,  # sampling and training forward must see the same network
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    model.eval()
+    model.eval()  # gradients still flow; this only disables dropout-like layers
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
-    # Show exactly what the model is being fed, once.
+    def make_optimizer():
+        return torch.optim.AdamW(trainable_params, lr=args.lr)
+
+    optimizer = make_optimizer()
+    last_good = _snapshot(trainable_params)
+
     example = sample_batch(random.Random(args.seed + 12345), 1)[0]
     print("\nRendered prompt for one example problem (enable_thinking="
           f"{args.enable_thinking}):\n{build_prompt(processor, example, args.enable_thinking)!r}\n")
@@ -412,87 +433,118 @@ def main() -> None:
         enable_thinking=args.enable_thinking, show_chars=args.print_completion_chars,
     )
     print(f"  greedy accuracy = {baseline_acc:.2%}")
+    print(f"\nTraining: {args.iterations} optimizer steps x {args.grad_accum} rollout(s) "
+          f"of {args.batch_size} prompt(s) each\n")
 
     running_baseline = 0.0
-    skipped = 0
+    stats = {"updated": 0, "skipped_logits": 0, "skipped_grad": 0, "rollbacks": 0}
+
     for step in range(1, args.iterations + 1):
-        problems = sample_batch(rng, args.batch_size)
-        prompts = [build_prompt(processor, p, args.enable_thinking) for p in problems]
+        optimizer.zero_grad()
+        step_rewards = []
+        first_completion = None
+        first_problem = None
+        micro_done = 0
 
-        enc = processor(text=prompts, return_tensors="pt", padding=True).to(model.device)
-        prompt_len = enc["input_ids"].shape[1]
+        for _ in range(args.grad_accum):
+            problems = sample_batch(rng, args.batch_size)
+            prompts = [build_prompt(processor, p, args.enable_thinking) for p in problems]
+            enc = processor(text=prompts, return_tensors="pt", padding=True).to(model.device)
+            prompt_len = enc["input_ids"].shape[1]
 
-        # Guard: a plain forward first. If the base model already produces
-        # non-finite logits for this input, generate() would hit the CUDA
-        # assert and kill the process. Skip instead, and say which input.
-        if not _logits_finite(model, enc):
-            skipped += 1
-            print(f"step {step:3d}: NON-FINITE logits from the base model for this batch -- skipping.")
-            for p in problems:
-                print(f"    offending prompt: {p['question']!r}")
+            if not _logits_finite(model, enc):
+                stats["skipped_logits"] += 1
+                print(f"step {step:3d}: NON-FINITE logits from the model for "
+                      f"{[p['question'] for p in problems]} -- skipping this rollout.")
+                continue
+
+            with torch.no_grad():
+                gen_out = model.generate(
+                    **enc,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=True,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    use_cache=True,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                )
+
+            rewards = []
+            for i, prob in enumerate(problems):
+                completion_text = _decode_completion(processor, gen_out[i], prompt_len)
+                r = verify_reward(completion_text, prob["answer"])
+                rewards.append(r)
+                if first_completion is None:
+                    first_completion, first_problem = completion_text, prob
+            step_rewards.extend(rewards)
+            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=gen_out.device)
+            advantages = rewards_t - running_baseline
+
+            attention_mask = (gen_out != processor.tokenizer.pad_token_id).long()
+            logits = model(input_ids=gen_out, attention_mask=attention_mask).logits
+            if not torch.isfinite(logits).all():
+                stats["skipped_logits"] += 1
+                print(f"step {step:3d}: non-finite logits in the training forward -- skipping this rollout.")
+                continue
+            log_probs = torch.log_softmax(logits[:, :-1, :].float(), dim=-1)
+            target_ids = gen_out[:, 1:]
+            token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+
+            gen_mask = torch.zeros_like(target_ids, dtype=torch.float32)
+            gen_mask[:, prompt_len - 1:] = 1.0
+            gen_mask *= attention_mask[:, 1:].float()
+            seq_log_prob = (token_log_probs * gen_mask).sum(dim=1) / gen_mask.sum(dim=1).clamp(min=1)
+
+            loss = -(advantages.to(seq_log_prob.device) * seq_log_prob).mean() / args.grad_accum
+            if not torch.isfinite(loss):
+                stats["skipped_logits"] += 1
+                print(f"step {step:3d}: non-finite loss -- skipping this rollout.")
+                continue
+            loss.backward()
+            micro_done += 1
+
+        if micro_done == 0:
+            optimizer.zero_grad()
+            print(f"step {step:3d}: no usable rollouts -- no update.")
             continue
 
-        with torch.no_grad():
-            gen_out = model.generate(
-                **enc,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=True,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
-                use_cache=True,
-                pad_token_id=processor.tokenizer.eos_token_id,
-            )
-
-        rewards = []
-        completions = []
-        for i, prob in enumerate(problems):
-            completion_text = _decode_completion(processor, gen_out[i], prompt_len)
-            completions.append(completion_text)
-            rewards.append(verify_reward(completion_text, prob["answer"]))
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=gen_out.device)
-
-        batch_mean = rewards_t.mean().item()
-        advantages = rewards_t - running_baseline
+        batch_mean = sum(step_rewards) / len(step_rewards)
         running_baseline = 0.9 * running_baseline + 0.1 * batch_mean
 
-        attention_mask = (gen_out != processor.tokenizer.pad_token_id).long()
-        logits = model(input_ids=gen_out, attention_mask=attention_mask).logits
-        if not torch.isfinite(logits).all():
-            skipped += 1
-            print(f"step {step:3d}: non-finite logits in the training forward pass -- skipping update.")
-            continue
-        log_probs = torch.log_softmax(logits[:, :-1, :].float(), dim=-1)
-        target_ids = gen_out[:, 1:]
-        token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-
-        gen_mask = torch.zeros_like(target_ids, dtype=torch.float32)
-        gen_mask[:, prompt_len - 1:] = 1.0
-        gen_mask *= attention_mask[:, 1:].float()
-
-        seq_log_prob = (token_log_probs * gen_mask).sum(dim=1) / gen_mask.sum(dim=1).clamp(min=1)
-        loss = -(advantages.to(seq_log_prob.device) * seq_log_prob).mean()
-
-        if not torch.isfinite(loss):
-            skipped += 1
-            print(f"step {step:3d}: non-finite loss -- skipping this step's optimizer update.")
+        # --- Gradient guard: this is where run 4 went wrong. ---
+        total_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+        if not torch.isfinite(total_norm):
+            optimizer.zero_grad()
+            stats["skipped_grad"] += 1
+            print(f"step {step:3d}: NON-FINITE gradient norm ({total_norm.item()}) -- "
+                  f"grads zeroed, update skipped, weights untouched.")
             continue
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
         optimizer.step()
+
+        # --- Parameter guard: never carry a poisoned adapter into the next step. ---
+        if not _params_finite(trainable_params):
+            stats["rollbacks"] += 1
+            _restore(trainable_params, last_good)
+            optimizer = make_optimizer()  # AdamW moments would be poisoned too
+            print(f"step {step:3d}: NON-FINITE parameters after optimizer.step() -- rolled back "
+                  f"to the last good adapter and reset the optimizer.")
+            continue
+        last_good = _snapshot(trainable_params)
+        stats["updated"] += 1
 
         if step % args.log_every == 0:
             print(
                 f"step {step:3d}/{args.iterations} | "
-                f"mean_reward={batch_mean:.3f} | baseline={running_baseline:.3f} | loss={loss.item():.4f}"
+                f"mean_reward={batch_mean:.3f} | baseline={running_baseline:.3f} | "
+                f"grad_norm={total_norm.item():.3f} | rollouts={micro_done}/{args.grad_accum}"
             )
-            _show(f"sample (gold={problems[0]['answer']}, reward={rewards[0]})",
-                  completions[0], args.print_completion_chars)
+            if first_completion is not None:
+                _show(f"sample (gold={first_problem['answer']}, reward={step_rewards[0]})",
+                      first_completion, args.print_completion_chars)
 
-    if skipped:
-        print(f"\n{skipped} step(s) skipped due to non-finite values -- see messages above.")
+    print(f"\nStep accounting: {stats}")
 
     print("\nAccuracy after training:")
     final_acc = _greedy_eval(
@@ -502,9 +554,12 @@ def main() -> None:
     print(f"  greedy accuracy = {final_acc:.2%} (baseline was {baseline_acc:.2%})")
 
     if args.save_dir:
-        model.save_pretrained(args.save_dir)  # LoRA adapter only, not the frozen base
-        processor.save_pretrained(args.save_dir)
-        print(f"Saved LoRA adapter to {args.save_dir}")
+        if _params_finite(trainable_params):
+            model.save_pretrained(args.save_dir)  # LoRA adapter only
+            processor.save_pretrained(args.save_dir)
+            print(f"Saved LoRA adapter to {args.save_dir}")
+        else:
+            print("Adapter is non-finite -- NOT saving.")
 
 
 if __name__ == "__main__":
@@ -528,10 +583,8 @@ mkdir -p "$LUSTRE_DIR/scripts"
 cat > "$LUSTRE_DIR/scripts/launch_rlvr_qwen38.sh" << 'SHEOF'
 #!/bin/bash
 # Runs INSIDE the pyxis/enroot container on the compute node.
-# EXPERIMENTAL -- see train_rlvr_qwen38.py's docstring for why this is a
-# different (LoRA + 4-bit + single-process device_map="auto") setup than
-# launch_rlvr.sh's DDP full-replica training, and for what has been
-# observed on hecate so far.
+# EXPERIMENTAL -- see train_rlvr_qwen38.py's docstring for the full history
+# of what has been observed on hecate and why the defaults are what they are.
 set -e
 
 LUSTRE_DIR="/lustre/fsw/general_sa/bbalakreshna"
@@ -542,22 +595,25 @@ pip install --quiet -r "$LUSTRE_DIR/requirements-qwen38.txt"
 export HF_HOME="$LUSTRE_DIR/hf_cache"
 mkdir -p "$HF_HOME"
 
-# Debugging aid while the NaN crash is being chased: makes CUDA kernel
-# launches synchronous so a device-side assert is reported at the op that
-# actually failed, not at some later sync point. Slows things down; remove
-# once a run completes cleanly.
-export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
+# Off by default now: the script guards logits, gradients and parameters
+# itself, so the CUDA assert should no longer fire, and synchronous kernel
+# launches slow every step. Set CUDA_LAUNCH_BLOCKING=1 in the environment
+# if you need a precise stack trace for a new failure.
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 
 echo "$(hostname): Launching RLVR fine-tuning for Qwen3.8-Flash-Next (single process, device_map=auto)..."
 python "$LUSTRE_DIR/train_rlvr_qwen38.py" \
   --model "${RLVR_MODEL:-Qwen/Qwen3.8-Flash-Next}" \
   --iterations "${RLVR_ITERATIONS:-10}" \
   --batch-size "${RLVR_BATCH_SIZE:-1}" \
+  --grad-accum "${RLVR_GRAD_ACCUM:-4}" \
   --max-new-tokens "${RLVR_MAX_NEW_TOKENS:-64}" \
   --lr "${RLVR_LR:-5e-6}" \
   --eval-n "${RLVR_EVAL_N:-6}" \
   --lora-r "${RLVR_LORA_R:-16}" \
   --seed "${RLVR_SEED:-0}" \
+  --quant "${RLVR_QUANT:-none}" \
+  --max-memory-per-gpu "${RLVR_MAX_MEMORY_PER_GPU:-200GiB}" \
   --skip-quant-modules "${RLVR_SKIP_QUANT_MODULES:-}" \
   --save-dir "$LUSTRE_DIR/out/rlvr-qwen38-run1"
 SHEOF
@@ -586,7 +642,7 @@ TIMING_FILE="$LUSTRE_DIR/out/hecate_qwen38_run1.timing"
        --partition=batch-xdr \
        --nodes=1 \
        --ntasks-per-node=1 \
-       --time=4:00:00 \
+       --time=5:00:00 \
        --job-name=general_sa-rlvr.qwen38 \
        --container-image=gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel \
        --container-mount-home \
@@ -715,93 +771,92 @@ export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
 mv -f "$LUSTRE_DIR/out/hecate_qwen38_run1.log"    "$LUSTRE_DIR/out/hecate_qwen38_diag.log"    2>/dev/null
 mv -f "$LUSTRE_DIR/out/hecate_qwen38_run1.timing" "$LUSTRE_DIR/out/hecate_qwen38_diag.timing" 2>/dev/null
 
-# 2. raise the SLURM time limit to the batch-xdr partition max (5h; it was 4h)
-sed -i 's/--time=4:00:00/--time=5:00:00/' "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"
-grep -n -- '--time=' "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"
-
-# 3. submit: 1000 steps, sync-launch debugging OFF (it slows every kernel launch), bigger eval
-RLVR_ITERATIONS=1000 CUDA_LAUNCH_BLOCKING=0 RLVR_EVAL_N=20 \
+# 2. submit: 1000 optimizer steps x 4 accumulated rollouts, bigger eval.
+#    (The submit script's --time is already the 5h batch-xdr max, and
+#    CUDA_LAUNCH_BLOCKING now defaults to 0 in the launcher.)
+RLVR_ITERATIONS=1000 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=20 \
   bash "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"
 ```
 
-Before submitting, check the per-step time from the diagnostic run:
-`cat "$LUSTRE_DIR/out/hecate_qwen38_diag.timing"`, then
-(elapsed seconds - ~120s of model loading) / 10 steps. Over ~15 s/step
-and 1000 steps won't fit in 5h -- either drop to `RLVR_ITERATIONS=500`
-or switch to the 8h `backfill-xdr` partition with
+Before submitting, check the per-step time from the diagnostic run's
+timing file and the `Step accounting:` line at the end of its log --
+only `updated` steps cost full time. Run 4 (batch 1, one rollout per
+step) averaged well under 30 s per real step; with `--grad-accum 4`
+expect roughly 4x that. If 1000 steps won't fit in 5h, drop
+`RLVR_ITERATIONS` or switch to the 8h `backfill-xdr` partition:
 `sed -i 's/--partition=batch-xdr/--partition=backfill-xdr/' "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"`.
 
-Batch size stays at 1 by default (left-padding into the recurrent
-layers was a NaN suspect), so 1000 steps is only 1000 samples -- a weak
-policy-gradient signal. If the diagnostic run showed no `NON-FINITE`
-lines, add `RLVR_BATCH_SIZE=4` to the submit line for 4x the signal per
-step.
+**Do not raise `RLVR_BATCH_SIZE` above 1.** Batching prompts requires
+left-padding, and that is what crashed runs 1-3 at step 3 (the
+recurrent Gated DeltaNet layers went NaN on padded input). More signal
+per step comes from `RLVR_GRAD_ACCUM` (single-prompt rollouts, losses
+accumulated, no padding) -- 8 or 16 is reasonable once a run completes.
 
 ## Known risks / what to check if it fails
 
-**Status: confirmed on real hardware -- three runs, the same crash every
-time.** Model load, LoRA attach, and 2 training steps ran successfully
-on every run (`trainable params: 5,701,632 || all params:
-177,398,532,208`), then hit an identical CUDA device-side assert
+**Status: four runs on hecate. Each failure was different from what it
+first looked like, and each one is now understood.** Model load and
+LoRA attach worked every time (`trainable params: 5,701,632 || all
+params: 177,398,532,208`).
+
+**Runs 1-3** (batch 2, 4-bit): an identical CUDA device-side assert
 (`probability tensor contains either inf, nan or element < 0`) inside
-`model.generate()`'s sampling at step 3. Runs 1 and 2 differed by a 20x
-learning rate; run 3 additionally had structured chat content and
-`use_cache=True` in `generate()`. **None of it changed anything**: the
-baseline stayed at exactly 0.00% and every sampled rollout scored
-exactly 0.1 on all three runs. Once the assert fires the CUDA context
-is dead; the process cannot recover, only avoid it.
+`model.generate()` at step 3, unchanged by a 20x learning-rate change,
+structured chat content, or `use_cache=True`. Baseline accuracy was
+0.00% and every rollout scored exactly 0.1 on all three.
 
-What the three runs actually tell us:
+**Run 4** (the instrumented version: batch 1, thinking off, finite-logits
+guard, 1000 steps) resolved both mysteries and exposed a third:
 
-1. **The 0% / 0.1 numbers are almost certainly thinking mode, not a
-   broken prompt.** This is a reasoning model that emits
-   `<think>...</think>` before answering (model card: "operate in
-   thinking mode by default"). With `--max-new-tokens 32` it never gets
-   out of the thinking block, so it never emits `Final Answer: N`.
-   Greedy eval can't score 1.0 (0%), and sampled rollouts score 0.1
-   because some digit inside the thinking text gets picked up as a
-   wrong "last integer". Rendering the template with
-   `enable_thinking=False` (the model card's documented switch) and
-   64 tokens should fix this. The round-2 "bare string content" theory
-   was wrong -- changing it changed nothing.
-2. **The crash is input-dependent, not lr-dependent.** LoRA's B matrix
-   is zero-initialised, so after two tiny steps the model is still
-   essentially the base model -- and the crash didn't move by even one
-   step across a 20x lr change. Both `random.Random(seed)` and
-   `torch.manual_seed(seed)` are fixed, so every run generates the
-   *same* problems in the *same* order: "always step 3" means "always
-   this one batch". Something about a specific input makes the 4-bit
-   quantised forward pass produce non-finite logits.
-3. **Nobody has seen a single completion yet.** The script never
-   printed one. That's now fixed -- it prints the rendered prompt once
-   and the first decoded completion of every eval / training step.
+1. **The step-3 crash was left-padding.** With `--batch-size 1` (no
+   padding) the run got through 135 real steps instead of dying at 3.
+   Batching prompts pads them to equal length; this architecture's
+   Gated DeltaNet layers are recurrent, and pad tokens entering the
+   recurrence drove it to NaN. `--batch-size` must stay 1;
+   `--grad-accum` provides the batch instead (single-prompt rollouts,
+   accumulated losses, zero padding).
+2. **The 0% baseline was thinking mode.** `enable_thinking=False` took
+   baseline accuracy from 0% to non-zero (5% with only 20 eval
+   problems). The earlier "bare string content" theory was wrong.
+3. **Then the adapter got poisoned.** After ~step 135 *every* input
+   produced non-finite logits (886 of 1000 steps skipped; the final
+   eval was 20/20 non-finite). A model that works for 135 steps and is
+   then broken on all inputs is not an input problem -- **the LoRA
+   weights themselves became NaN.** Mechanism: one step produced a
+   non-finite gradient (a finite loss does not guarantee finite
+   gradients), `clip_grad_norm_` computed an infinite norm, so the clip
+   coefficient was 0 and `inf x 0 = NaN` landed in the grads;
+   `optimizer.step()` wrote NaN into the adapter and into AdamW's
+   moments; every forward thereafter was NaN. The run-4 guard checked
+   logits and loss but never gradients or parameters.
+4. **The "4-bit" model wasn't 4-bit.** `nvidia-smi` showed ~436GB in
+   use across GPUs 0-1 with GPUs 2-3 empty. bitsandbytes only
+   quantises `nn.Linear`; this architecture's fused MoE expert tensors
+   and its 51B-param n-gram `nn.Embedding` aren't that, so the model
+   was mostly bf16 with a scattering of NF4 layers -- a mixed state
+   that saves little memory and is itself a NaN suspect. And these GPUs
+   have ~280GB each: the whole model fits in bf16 across four of them.
 
-What the current script does about it (instrumented to diagnose, not
-guess): a plain forward pass over each prompt with an `isfinite` check
-*before* `generate()` -- if the base model already produces NaN for an
-input, it prints the offending prompt and skips instead of hitting the
-CUDA assert; `--batch-size 1` by default so left-padding into the
-recurrent Gated DeltaNet layers is off the table as a variable;
-`CUDA_LAUNCH_BLOCKING=1` set in `launch_rlvr_qwen38.sh` so any
-remaining assert names the real failing op; `--list-modules` to dump
-the architecture's real module names on the meta device in seconds;
-`--skip-quant-modules` to keep named `nn.Linear` layers (routers,
-gates, the sparse-attention indexer, MTP) in bf16 instead of 4-bit;
-and `--seed` to check whether the crash follows the inputs.
+What the current script does about each: `--quant none` (bf16) by
+default with `--max-memory-per-gpu` so `device_map="auto"` spreads the
+shards over *all* GPUs (it prints the per-GPU allocation after load);
+`--batch-size 1` + `--grad-accum` (default 4); a **gradient guard**
+(`clip_grad_norm_`'s returned norm is checked -- non-finite means grads
+are zeroed and the step skipped *before* `optimizer.step()`); a
+**parameter guard** (a ~23MB copy of the LoRA weights is kept; if any
+parameter is non-finite after a step, the adapter is rolled back and
+the optimizer rebuilt, so a bad step costs one step, not the run); and
+the adapter is only saved if it is finite. The `Step accounting:` line
+at the end of the log reports `updated / skipped_logits / skipped_grad
+/ rollbacks` -- if `skipped_grad` or `rollbacks` is non-zero the guards
+are earning their keep; if `updated` is most of the steps, the run is
+healthy.
 
-Suggested order for the next run: (1) run `--list-modules` first
-(fast, no GPU needed) and look for router/gate/indexer names; (2) run
-the default config and read the printed completions -- if baseline
-accuracy is now non-zero, thinking mode was the 0% cause; (3) if a
-"NON-FINITE logits ... offending prompt" line appears, that is the
-smoking gun -- try the same run with `RLVR_SKIP_QUANT_MODULES` set to
-the router/gate names from step 1; (4) if the assert still fires
-despite the guard, the synchronous trace (thanks to
-`CUDA_LAUNCH_BLOCKING=1`) will name the actual kernel. If skipping
-routers/gates doesn't help, the remaining lever is 8-bit
-(`load_in_8bit=True`) instead of NF4, memory permitting -- 4-bit
-quantisation of an architecture nobody has validated at 4-bit is the
-leading suspect for the NaN itself.
+Not yet re-verified against hardware. If a run still shows non-finite
+logits from the *base* model on the very first eval (before any
+training), that would be a genuine bf16 forward-pass problem in this
+architecture, and `CUDA_LAUNCH_BLOCKING=1` plus `--seed` variations are
+the tools to localise it.
 
 Other risks not yet encountered:
 
