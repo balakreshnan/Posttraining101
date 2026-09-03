@@ -641,6 +641,102 @@ cat "$LUSTRE_DIR/out/hecate_qwen38_run1.timing"
 Watch the very start of the log closely -- if `AutoModelForImageTextToText.from_pretrained(...)`
 fails, nothing downstream matters until that's fixed.
 
+## 5. Gather diagnostics from the run
+
+Paste the output of this block when asking for help interpreting a run --
+the three things that matter most are the `Rendered prompt` (does it
+contain `<think>`?), the `eval sample ... : '...'` line (what the model
+actually said), and any `NON-FINITE ... offending prompt:` line.
+
+```bash
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
+LOG="$LUSTRE_DIR/out/hecate_qwen38_run1.log"
+
+echo "===== JOB STATE ====="; squeue -u $USER
+echo "===== LOG HEAD (prompt + first completions) ====="; head -80 "$LOG"
+echo "===== KEY LINES ====="; grep -nE "greedy accuracy|NON-FINITE|non-finite|offending prompt|skipped|Traceback|Error|Assertion|^step " "$LOG" | head -60
+echo "===== TIMING ====="; cat "$LUSTRE_DIR/out/hecate_qwen38_run1.timing" 2>/dev/null
+echo "===== MODULE LIST (first 60) ====="; head -60 "$LUSTRE_DIR/out/qwen38_modules.txt" 2>/dev/null
+```
+
+## 6. Insights: text summary + interactive HTML dashboard
+
+`analyze_run.py` and `generate_dashboard.py` (from
+[`executeshell-multigpu.md`](executeshell-multigpu.md)) work on this
+run unchanged -- `train_rlvr_qwen38.py` deliberately prints the same
+`step N/M | mean_reward=... | baseline=... | loss=...` and
+`greedy accuracy = X%` lines they parse. The per-operator charts will
+be empty (this script doesn't log per-operator stats) and the "Device"
+stat card is omitted (different load message); everything else
+populates. Both tools are stdlib-only, so they run on the login node's
+system `python3` with no venv.
+
+```bash
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
+LOG="$LUSTRE_DIR/out/hecate_qwen38_run1.log"
+TIMING="$LUSTRE_DIR/out/hecate_qwen38_run1.timing"
+
+# the two tools were originally written under the old rlvr-posttraining101 subfolder -- copy up if needed
+for f in analyze_run.py generate_dashboard.py; do
+  [ -f "$LUSTRE_DIR/$f" ] || cp "$LUSTRE_DIR/rlvr-posttraining101/$f" "$LUSTRE_DIR/$f"
+done
+
+python3 "$LUSTRE_DIR/analyze_run.py" "$LOG" --timing "$TIMING"
+python3 "$LUSTRE_DIR/generate_dashboard.py" "$LOG" --timing "$TIMING" \
+  --output "$LUSTRE_DIR/out/hecate_qwen38_run1_dashboard.html"
+```
+
+Then pull the dashboard down from a **fresh local terminal on your own
+machine** (not inside the SSH session -- `scp` copies *to* wherever it
+runs, and `$HOME/Downloads` doesn't exist on the login node). It
+prompts for the usual MFA device code:
+
+```powershell
+scp bbalakreshna-mfa@login-hecate.nvidia.com:/lustre/fsw/general_sa/bbalakreshna/out/hecate_qwen38_run1_dashboard.html C:\Users\bbalakreshna\Downloads\hecate_qwen38_run1_dashboard.html
+```
+
+It's a single self-contained HTML file -- double-click to open. Chart.js
+loads from a CDN, so the browser needs internet; the cluster doesn't.
+If the run crashed at step 3 the dashboard will only have 2 data points
+-- section 5's output is what matters in that case.
+
+## 7. Scaling up to 1000 steps
+
+**Only after a 10-step diagnostic run has completed cleanly** (a final
+`Accuracy after training` line, no crash). If it still dies at step 3,
+1000 steps will die at step 3 too. No code change is needed -- the
+launcher is env-var driven -- but two things in the submit script don't
+fit a long run, so this block adjusts them:
+
+```bash
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
+
+# 1. keep the 10-step diagnostic log; the submit script would overwrite it
+mv -f "$LUSTRE_DIR/out/hecate_qwen38_run1.log"    "$LUSTRE_DIR/out/hecate_qwen38_diag.log"    2>/dev/null
+mv -f "$LUSTRE_DIR/out/hecate_qwen38_run1.timing" "$LUSTRE_DIR/out/hecate_qwen38_diag.timing" 2>/dev/null
+
+# 2. raise the SLURM time limit to the batch-xdr partition max (5h; it was 4h)
+sed -i 's/--time=4:00:00/--time=5:00:00/' "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"
+grep -n -- '--time=' "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"
+
+# 3. submit: 1000 steps, sync-launch debugging OFF (it slows every kernel launch), bigger eval
+RLVR_ITERATIONS=1000 CUDA_LAUNCH_BLOCKING=0 RLVR_EVAL_N=20 \
+  bash "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"
+```
+
+Before submitting, check the per-step time from the diagnostic run:
+`cat "$LUSTRE_DIR/out/hecate_qwen38_diag.timing"`, then
+(elapsed seconds - ~120s of model loading) / 10 steps. Over ~15 s/step
+and 1000 steps won't fit in 5h -- either drop to `RLVR_ITERATIONS=500`
+or switch to the 8h `backfill-xdr` partition with
+`sed -i 's/--partition=batch-xdr/--partition=backfill-xdr/' "$LUSTRE_DIR/scripts/submit_hecate_qwen38.sh"`.
+
+Batch size stays at 1 by default (left-padding into the recurrent
+layers was a NaN suspect), so 1000 steps is only 1000 samples -- a weak
+policy-gradient signal. If the diagnostic run showed no `NON-FINITE`
+lines, add `RLVR_BATCH_SIZE=4` to the submit line for 4x the signal per
+step.
+
 ## Known risks / what to check if it fails
 
 **Status: confirmed on real hardware -- three runs, the same crash every
