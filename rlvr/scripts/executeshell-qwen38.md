@@ -107,19 +107,31 @@ Defaults are intentionally tiny (batch 2, 10 iterations, 32 new tokens).
 
 Confirmed on real hardware: model load + LoRA attach works (144-file
 fetch, weight load, "trainable params: 5.7M / 177.4B" as expected).
-First attempt (lr=1e-4, top_k=0, double-quant on) hit a CUDA device-side
+
+Round 1 failure (lr=1e-4, top_k=0, double-quant on): CUDA device-side
 assert ("probability tensor contains inf, nan or element < 0") inside
-model.generate()'s sampling, 2 steps in -- almost certainly 4-bit
-quantization interacting with this architecture's more exotic layers
-(Gated DeltaNet / sparse attention / MoE) once the LoRA delta shifted
-the forward pass. Once that assert fires the CUDA context is corrupted;
-there's no recovering within the same process, only preventing it.
-Mitigations applied here: lr dropped to 5e-6, max_grad_norm to 0.3,
-double quantization disabled, sampling switched to the model card's own
-recommended top_p/top_k instead of unrestricted top_k=0, plus an
-isfinite() guard around our own forward pass's logits/loss (skips that
-step's update rather than propagating NaN gradients -- note this guard
-can't catch a crash inside generate() itself, only in our own forward).
+model.generate()'s sampling, 2 steps in. Mitigated with a much lower
+lr (5e-6), tighter grad clipping, double-quant off, and the model
+card's recommended top_p/top_k instead of unrestricted top_k=0.
+
+Round 2 failure: identical crash, same step, despite the 20x lower lr
+-- which ruled out update magnitude as the cause and pointed at two
+other bugs, both now fixed:
+  1. Baseline accuracy was 0.00% (not even a parseable number) even
+     before training. build_prompt() was passing a bare string as
+     chat-message content; this is a multimodal processor whose
+     documented examples all use structured content blocks
+     ([{"type": "text", "text": ...}]). Fixed.
+  2. model.config.use_cache=False was applied globally, including
+     during generate(). Fine for a standard transformer, but this
+     architecture's Gated DeltaNet layers are recurrent/stateful --
+     generate() now passes use_cache=True explicitly to override that.
+  Also switched lora_dropout 0.05 -> 0.0 and moved the model to a
+  permanent eval() mode (never .train()) -- with dropout active, the
+  log-probs computed in the training forward pass wouldn't have
+  matched the distribution that actually produced the sampled tokens
+  during generate(), biasing the REINFORCE gradient regardless of the
+  crash. Still not re-verified against hardware.
 """
 
 import argparse
@@ -140,7 +152,12 @@ except ImportError as e:
 
 
 def build_prompt(processor, problem: dict) -> str:
-    messages = [{"role": "user", "content": problem["question"]}]
+    # Structured content blocks, not a bare string -- this is a multimodal
+    # processor and every documented example on the model card uses
+    # [{"type": "text", "text": ...}] even for text-only turns. A bare
+    # string produced 0.00% baseline accuracy (not even a parseable
+    # number), suggesting the template mishandles unstructured content.
+    messages = [{"role": "user", "content": [{"type": "text", "text": problem["question"]}]}]
     return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
@@ -196,6 +213,9 @@ def _greedy_eval(model, processor, rng, n, max_new_tokens):
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            use_cache=True,  # config.use_cache=False (set for training) would otherwise
+                              # disable it here too -- this architecture's recurrent
+                              # Gated DeltaNet layers likely need it for correct generation
             pad_token_id=processor.tokenizer.eos_token_id,
         )
         completion = processor.tokenizer.decode(
@@ -244,13 +264,19 @@ def main() -> None:
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         target_modules=[m.strip() for m in args.lora_target_modules.split(",")],
-        lora_dropout=0.05,
+        # 0.0, not the usual 0.05 -- with dropout on, the log-probs computed in the
+        # training forward pass below wouldn't match the distribution that actually
+        # produced the sampled tokens during generate() (different dropout mask each
+        # forward), biasing the REINFORCE gradient. Keeping the model in eval() mode
+        # throughout (never calling .train()) makes this moot either way.
+        lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    model.train()
+    model.eval()  # see lora_dropout comment above -- gradients still flow fine in
+                  # eval() mode, this only affects dropout/similar stochastic layers
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
@@ -275,6 +301,11 @@ def main() -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                use_cache=True,  # model.config.use_cache=False (set above, needed for
+                                  # the training forward pass immediately below) would
+                                  # otherwise disable it here too -- this architecture's
+                                  # recurrent Gated DeltaNet layers likely need it for
+                                  # correct generation
                 pad_token_id=processor.tokenizer.eos_token_id,
             )
 
@@ -459,36 +490,67 @@ fails, nothing downstream matters until that's fixed.
 
 ## Known risks / what to check if it fails
 
-**Status: confirmed on real hardware.** Model load, LoRA attach, and 2
-training steps ran successfully (144-file fetch, weight load,
-`trainable params: 5,701,632 || all params: 177,398,532,208`). The
-first attempt then hit a CUDA device-side assert
-(`probability tensor contains inf, nan or element < 0`) inside
-`model.generate()`'s sampling at step 3, at `lr=1e-4` / `top_k=0` /
-double-quant enabled. Once that assert fires the CUDA context is
-corrupted -- the job can't recover in-process, only a fresh run with
-different settings can avoid it. Current defaults (`lr=5e-6`,
-`max_grad_norm=0.3`, double-quant disabled, `top_p=0.8`/`top_k=20`
-matching the model card's own recommended sampling) are the fix for
-that specific failure -- not yet re-confirmed against hardware.
+**Status: confirmed on real hardware, two rounds of the same crash so
+far.** Model load, LoRA attach, and 2 training steps ran successfully
+both times (144-file fetch, weight load, `trainable params: 5,701,632
+|| all params: 177,398,532,208`), then hit an identical CUDA
+device-side assert (`probability tensor contains inf, nan or element
+< 0`) inside `model.generate()`'s sampling at step 3 -- **both times**,
+despite round 2 using a learning rate 20x lower than round 1 (`5e-6` vs
+`1e-4`). Once that assert fires the CUDA context is corrupted -- the
+job can't recover in-process, only a fresh run with different settings
+can avoid it.
 
-1. **"Unrecognized architecture" / `qwen4_exp` not found** -- did not
-   occur; the container's `transformers` (after `pip install -U`)
-   already supports `qwen4_exp`. Leaving this note in case a different
-   container image is used later.
-2. **NaN/inf logits during generation** (see above) -- if this recurs
-   even with the current conservative settings, the next thing to try
-   is dropping `--lr` further (e.g. `1e-6`) or disabling 4-bit entirely
-   in favor of 8-bit (`load_in_8bit=True` instead of `load_in_4bit`) if
-   GPU memory allows -- 8-bit is generally more numerically stable than
-   NF4 for architectures that haven't been validated at 4-bit.
-3. **OOM during model load** -- even at 4-bit, ~180B params is roughly
-   90GB+ of weights alone (before activations/KV cache). If the node's
-   visible GPUs don't have enough combined memory, `device_map="auto"`
-   will fail to place all layers. Reduce `--max-new-tokens` and
-   `--batch-size` further.
-4. **Only attention layers are trainable.** If the run completes but
-   accuracy doesn't move much, that's expected to some degree -- the
-   512-expert MoE layers (where most of the model's capacity lives)
-   are frozen by design here. This is a deliberate simplicity
-   trade-off, not a bug.
+That the crash was identical at the same step regardless of a 20x LR
+change ruled out update magnitude as the cause and pointed at two
+actual bugs (both now fixed, not yet re-verified against hardware):
+
+1. **Baseline accuracy was 0.00%** (not a single parseable number, out
+   of 6 eval problems) even before any training happened. Root cause:
+   `build_prompt()` was passing a bare string as chat-message content.
+   This is a *multimodal* processor -- every documented example on the
+   model card uses structured content blocks
+   (`[{"type": "text", "text": ...}]`), even for text-only turns. Fixed
+   to match.
+2. **`model.config.use_cache = False` was applied globally**, including
+   during `generate()`. Fine for a standard transformer (it's normally
+   only needed to disable KV-cache bookkeeping during the *training*
+   forward pass), but this architecture's Gated DeltaNet layers are
+   recurrent/stateful -- disabling caching during generation may break
+   how that state propagates. `generate()` now passes `use_cache=True`
+   explicitly to override the config for that call.
+
+Also switched `lora_dropout` `0.05 -> 0.0` and moved the model to a
+permanent `eval()` mode (never `.train()`): with dropout active, the
+log-probs computed in the training forward pass wouldn't have matched
+the distribution that actually produced the sampled tokens during
+`generate()` (different dropout mask each forward pass), biasing the
+REINFORCE gradient independent of the crash.
+
+If this specific crash recurs a third time even with all of the above,
+the next things to try, in order: (a) drop `--lr` further (e.g. `1e-6`)
+just to be certain magnitude truly isn't a factor, (b) switch from
+4-bit to 8-bit quantization (`load_in_8bit=True` instead of
+`load_in_4bit`) if GPU memory allows -- 8-bit is generally more
+numerically stable than NF4 for architectures that haven't been
+validated at 4-bit, (c) try `CUDA_LAUNCH_BLOCKING=1` to get a precise
+(synchronous) stack trace instead of the async-reported one currently
+shown, since the real failing op may not be in `_has_unfinished_sequences`
+at all.
+
+Other risks not yet encountered:
+
+- **"Unrecognized architecture" / `qwen4_exp` not found** -- did not
+  occur; the container's `transformers` (after `pip install -U`)
+  already supports `qwen4_exp`. Leaving this note in case a different
+  container image is used later.
+- **OOM during model load** -- even at 4-bit, ~180B params is roughly
+  90GB+ of weights alone (before activations/KV cache). If the node's
+  visible GPUs don't have enough combined memory, `device_map="auto"`
+  will fail to place all layers. Reduce `--max-new-tokens` and
+  `--batch-size` further.
+- **Only attention layers are trainable.** If the run completes but
+  accuracy doesn't move much, that's expected to some degree -- the
+  512-expert MoE layers (where most of the model's capacity lives)
+  are frozen by design here. This is a deliberate simplicity
+  trade-off, not a bug.
