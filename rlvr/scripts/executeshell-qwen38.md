@@ -717,25 +717,28 @@ echo "===== MODULE LIST (first 60) ====="; head -60 "$LUSTRE_DIR/out/qwen38_modu
 
 ## 6. Insights: text summary + interactive HTML dashboard
 
-`analyze_run.py` and `generate_dashboard.py` (from
-[`executeshell-multigpu.md`](executeshell-multigpu.md)) work on this
-run unchanged -- `train_rlvr_qwen38.py` deliberately prints the same
-`step N/M | mean_reward=... | baseline=... | loss=...` and
-`greedy accuracy = X%` lines they parse. The per-operator charts will
-be empty (this script doesn't log per-operator stats) and the "Device"
-stat card is omitted (different load message); everything else
-populates. Both tools are stdlib-only, so they run on the login node's
-system `python3` with no venv.
+`analyze_run.py` and `generate_dashboard.py` understand both log
+formats: `train_rlvr.py`'s `step N/M | ... | loss=...` and this script's
+`step N/M | ... | grad_norm=... | rollouts=a/b`. For a qwen38 run the
+dashboard additionally shows the `Step accounting` counters as stat
+cards, a histogram of *where* the gradient guard fired, the
+gradient-norm trajectory (it falls to ~0 once the baseline catches the
+reward -- i.e. the task is solved), rollouts completed per step,
+per-GPU memory after load (confirms the shards were balanced), and the
+first baseline/final eval completions verbatim. Both tools are
+stdlib-only: login-node system `python3`, no venv.
+
+**Paste the current versions of both tools first** -- the `cat` heredocs
+are in [`executeshell-multigpu.md`](executeshell-multigpu.md) under
+"Generating insights from the run" and "Interactive HTML insights
+dashboard". Older copies (e.g. under the retired `rlvr-posttraining101`
+subfolder) require a `loss=` field and report "No step lines found" on
+a qwen38 log.
 
 ```bash
 export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
 LOG="$LUSTRE_DIR/out/hecate_qwen38_run1.log"
 TIMING="$LUSTRE_DIR/out/hecate_qwen38_run1.timing"
-
-# the two tools were originally written under the old rlvr-posttraining101 subfolder -- copy up if needed
-for f in analyze_run.py generate_dashboard.py; do
-  [ -f "$LUSTRE_DIR/$f" ] || cp "$LUSTRE_DIR/rlvr-posttraining101/$f" "$LUSTRE_DIR/$f"
-done
 
 python3 "$LUSTRE_DIR/analyze_run.py" "$LOG" --timing "$TIMING"
 python3 "$LUSTRE_DIR/generate_dashboard.py" "$LOG" --timing "$TIMING" \

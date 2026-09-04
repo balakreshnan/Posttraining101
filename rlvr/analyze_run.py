@@ -16,9 +16,13 @@ import argparse
 import re
 import statistics
 
+# Matches both train_rlvr.py (…| loss=x) and train_rlvr_qwen38.py (…| grad_norm=x | rollouts=a/b)
 STEP_RE = re.compile(
-    r"step\s+(\d+)/(\d+)\s*\|\s*mean_reward=([\d.]+)\s*\|\s*baseline=([\d.]+)\s*\|\s*loss=(-?[\d.]+)"
+    r"step\s+(\d+)/(\d+)\s*\|\s*mean_reward=([\d.]+)\s*\|\s*baseline=([\d.]+)"
+    r"(?:\s*\|\s*loss=(-?[\d.]+))?(?:\s*\|\s*grad_norm=([\d.]+))?"
 )
+SKIP_GRAD_RE = re.compile(r"^step\s+(\d+): NON-FINITE gradient norm", re.MULTILINE)
+ACCOUNTING_RE = re.compile(r"Step accounting:\s*(\{.*\})")
 ACCURACY_RE = re.compile(r"greedy accuracy\s*=\s*([\d.]+)%")
 DEVICE_RE = re.compile(r"Using device:\s*(.+)")
 SAVED_RE = re.compile(r"Saved fine-tuned model to (.+)")
@@ -47,11 +51,17 @@ def main() -> None:
         text = f.read()
 
     steps, rewards, baselines, losses = [], [], [], []
+    grad_norms = []
     for m in STEP_RE.finditer(text):
         steps.append(int(m.group(1)))
         rewards.append(float(m.group(3)))
         baselines.append(float(m.group(4)))
-        losses.append(float(m.group(5)))
+        if m.group(5) is not None:
+            losses.append(float(m.group(5)))
+        if m.group(6) is not None:
+            grad_norms.append(float(m.group(6)))
+    skipped_grad = [int(s) for s in SKIP_GRAD_RE.findall(text)]
+    accounting_m = ACCOUNTING_RE.search(text)
 
     accuracies = [float(x) for x in ACCURACY_RE.findall(text)]
     device_match = DEVICE_RE.search(text)
@@ -81,11 +91,29 @@ def main() -> None:
     print(f"  Max / Min:         {max(rewards):.3f} / {min(rewards):.3f}")
     print(f"  Running baseline:  {baselines[0]:.3f} -> {baselines[-1]:.3f}")
 
-    print()
-    print("-- Loss --")
-    print(f"  Early avg (first {head_n}): {statistics.mean(losses[:head_n]):.4f}")
-    print(f"  Late avg  (last {tail_n}):  {statistics.mean(losses[-tail_n:]):.4f}")
-    print(f"  Std dev (all steps): {statistics.pstdev(losses):.4f}")
+    if losses:
+        print()
+        print("-- Loss --")
+        print(f"  Early avg (first {head_n}): {statistics.mean(losses[:head_n]):.4f}")
+        print(f"  Late avg  (last {tail_n}):  {statistics.mean(losses[-tail_n:]):.4f}")
+        print(f"  Std dev (all steps): {statistics.pstdev(losses):.4f}")
+
+    if grad_norms:
+        print()
+        print("-- Gradient norm (after clipping) --")
+        print(f"  Early avg (first {head_n}): {statistics.mean(grad_norms[:head_n]):.4f}")
+        print(f"  Late avg  (last {tail_n}):  {statistics.mean(grad_norms[-tail_n:]):.4f}")
+        print(f"  Max:                 {max(grad_norms):.4f}")
+        print("  (-> 0 late in the run means the baseline caught up with the reward: task solved)")
+
+    if skipped_grad or accounting_m:
+        print()
+        print("-- Stability guards (train_rlvr_qwen38.py) --")
+        if skipped_grad:
+            first, last = skipped_grad[0], skipped_grad[-1]
+            print(f"  Steps skipped for non-finite gradient: {len(skipped_grad)} (first at step {first}, last at step {last})")
+        if accounting_m:
+            print(f"  Step accounting: {accounting_m.group(1)}")
 
     if len(accuracies) >= 2:
         baseline_acc, final_acc = accuracies[0], accuracies[-1]
