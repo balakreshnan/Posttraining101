@@ -32,6 +32,7 @@ ACCURACY_RE = re.compile(r"greedy accuracy\s*=\s*([\d.]+)%")
 DEVICE_RE = re.compile(r"Using device:\s*(.+)")
 LOAD_RE = re.compile(r"Loading (\S+) \(([^)]*)\), sharded across (\d+) GPU")
 GPU_MEM_RE = re.compile(r"GPU (\d+): ([\d.]+) GiB allocated after load")
+DDP_RE = re.compile(r"DDP x(\d+) ranks")
 SAVED_RE = re.compile(r"Saved (?:fine-tuned model|LoRA adapter) to (.+)")
 PER_OP_EVAL_RE = re.compile(r"(baseline|final) by operator -- (.+)")
 PER_OP_EVAL_ENTRY_RE = re.compile(r"([+\-*]):\s*([\d.]+)%\s*\((\d+)/(\d+)\)")
@@ -109,6 +110,21 @@ def parse_log(path: str, skip_bin: int) -> dict:
 
     gpu_mem = {int(i): float(g) for i, g in GPU_MEM_RE.findall(text)}
 
+    # DDP logs written before the all-gather fix (commit 444aeeb) printed
+    # torch.cuda.memory_allocated() from rank 0 only, which is a per-process
+    # counter -- GPUs 1..N-1 show 0.0 even though each rank holds a full
+    # replica there. Detect that case so the dashboard can say so instead of
+    # drawing three idle-looking bars. New-style logs carry a
+    # "(rank-local replica)" suffix and are gathered from every rank.
+    ddp = DDP_RE.search(text)
+    ddp_ranks = int(ddp.group(1)) if ddp else 0
+    rank_local = "(rank-local replica)" in text
+    gpu_mem_rank0_only = bool(
+        ddp_ranks > 1 and not rank_local and gpu_mem
+        and gpu_mem.get(0, 0.0) > 0.0
+        and all(gpu_mem.get(i, 0.0) == 0.0 for i in range(1, ddp_ranks))
+    )
+
     per_op_eval = {}
     for label, rest in PER_OP_EVAL_RE.findall(text):
         per_op_eval[label] = {op: (int(c), int(t)) for op, _, c, t in PER_OP_EVAL_ENTRY_RE.findall(rest)}
@@ -126,6 +142,8 @@ def parse_log(path: str, skip_bin: int) -> dict:
         "accuracies": [float(x) for x in ACCURACY_RE.findall(text)],
         "device": device,
         "gpu_mem": gpu_mem,
+        "ddp_ranks": ddp_ranks,
+        "gpu_mem_rank0_only": gpu_mem_rank0_only,
         "saved_to": saved.group(1).strip() if saved else None,
         "per_op_eval": per_op_eval,
         "per_op_train": per_op_train,
@@ -335,12 +353,31 @@ if (hasPerOp) {
     options: { responsive: true, scales: { y: { min: 0, max: 1.05 } } } });
 }
 if (hasGpu) {
-  panels.appendChild(panel("GPU memory allocated after model load",
-    "Balanced bars = device_map spread the shards across all GPUs. One or two tall bars with the rest near zero = the run-4 placement problem.", "gpuChart"));
   const ids = Object.keys(DATA.gpu_mem).sort((a, b) => a - b);
+  let note, datasets;
+  if (DATA.gpu_mem_rank0_only) {
+    // Old-format DDP log: only rank 0's per-process counter was printed, so GPUs 1..N-1 read 0.0
+    // even though every rank holds its own full replica. Show rank 0 as measured and the other
+    // ranks as inferred copies of it, clearly labelled, rather than as idle GPUs.
+    const r0 = DATA.gpu_mem[ids[0]];
+    note = `DDP x${DATA.ddp_ranks}: one full model replica per GPU. This log predates the per-rank all-gather fix (commit 444aeeb), ` +
+           `so only rank 0's per-process counter was recorded and GPUs 1-${DATA.ddp_ranks - 1} printed 0.0. ` +
+           `The outlined bars are inferred (= rank 0's ${r0.toFixed(1)} GiB); nvidia-smi during the run showed all ${DATA.ddp_ranks} GPUs at ~${Math.round(r0 * 1.3)} GiB used.`;
+    datasets = [
+      { label: "GiB allocated (measured, rank 0)", data: ids.map(i => Number(i) === 0 ? r0 : null), backgroundColor: "#6ea8feaa" },
+      { label: "GiB allocated (inferred replica)", data: ids.map(i => Number(i) === 0 ? null : r0), backgroundColor: "#6ea8fe44", borderColor: "#6ea8fe", borderWidth: 1, borderDash: [4, 3] },
+    ];
+  } else if (DATA.ddp_ranks > 1) {
+    note = `DDP x${DATA.ddp_ranks}: each bar is that rank's own replica (gathered from every rank). Bars should be equal.`;
+    datasets = [ { label: "GiB allocated (rank-local replica)", data: ids.map(i => DATA.gpu_mem[i]), backgroundColor: "#6ea8feaa" } ];
+  } else {
+    note = "Balanced bars = device_map spread the shards across all GPUs. One or two tall bars with the rest near zero = the run-4 placement problem (or a deliberate single-GPU run).";
+    datasets = [ { label: "GiB allocated", data: ids.map(i => DATA.gpu_mem[i]), backgroundColor: "#6ea8feaa" } ];
+  }
+  panels.appendChild(panel("GPU memory allocated after model load", note, "gpuChart"));
   new Chart(document.getElementById("gpuChart"), { type: "bar",
-    data: { labels: ids.map(i => "GPU " + i), datasets: [ { label: "GiB allocated", data: ids.map(i => DATA.gpu_mem[i]), backgroundColor: "#6ea8feaa" } ] },
-    options: { responsive: true, scales: { y: { beginAtZero: true, title: { display: true, text: "GiB" } } } } });
+    data: { labels: ids.map(i => "GPU " + i), datasets },
+    options: { responsive: true, scales: { x: { stacked: true }, y: { beginAtZero: true, title: { display: true, text: "GiB" } } } } });
 }
 
 // ---- Sample completions ----

@@ -129,10 +129,17 @@ previewer) to see the charts.
     so part of the delta is the truncation penalty biting on eval rather
     than wrong arithmetic. The model was already at ~94% before training;
     the headroom on GSM8K for this model is a few points at most.
-  - **GPU memory line `58.9 / 0 / 0 / 0 GiB`** is the rank-0 process's
-    view only (each rank holds its own ~59 GiB replica; `nvidia-smi` during
-    the run showed 75-79 GiB used on all four GPUs). The all-gather fix
-    that reports every rank landed after this job was submitted.
+  - **All four GPUs were used.** `nvidia-smi` during the run showed four
+    processes (one per torchrun rank) holding 75-79 GiB on GPUs 0-3. The
+    log's `58.9 / 0 / 0 / 0 GiB` line is the rank-0 process's per-process
+    counter only; the all-gather fix that reports every rank (commit
+    `444aeeb`) landed after this job was submitted. The dashboard detects
+    this old-format DDP log and draws GPU 0 as measured and GPUs 1-3 as
+    dashed "inferred replica" bars (equal to rank 0), with a note saying
+    why -- not as idle GPUs.
+  - `hecate_nemotron_gsm8k_1000step.timing` holds the job's start/end
+    stamps so the dashboard can be regenerated locally from the log:
+    `python rlvr/generate_dashboard.py insights/hecate_nemotron_gsm8k_1000step.log --timing insights/hecate_nemotron_gsm8k_1000step.timing --output <out.html>`.
   - **Next levers**, if the goal is to move the held-out number rather
     than trade noise: `RLVR_MAX_NEW_TOKENS=640` (stop penalising
     correct-but-long solutions, the main source of negative advantage) and
