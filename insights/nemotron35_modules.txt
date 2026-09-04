@@ -1,0 +1,35 @@
+# Output of: python3 train_rlvr_nemotron.py --list-modules
+# Model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 (architecture nemotron_h)
+# Captured on hecate login node, 2026-09-04, before job 533496 was submitted.
+# Meta-device build succeeded -> the installed transformers knows this architecture.
+
+28 distinct module patterns in nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16:
+
+  Linear                                   lm_head  in=2688 out=131072
+  NemotronHModel                           model
+  Embedding                                model.embeddings
+  ModuleList                               model.layers
+  NemotronHBlock                           model.layers.N
+  NemotronHMamba2Mixer                     model.layers.N.mixer
+  NemotronHMoE                             model.layers.N.mixer
+  NemotronHAttention                       model.layers.N.mixer
+  SiLUActivation                           model.layers.N.mixer.act
+  Conv1d                                   model.layers.N.mixer.conv1d
+  NemotronHExperts                         model.layers.N.mixer.experts
+  ReLUSquaredActivation                    model.layers.N.mixer.experts.act_fn
+  Identity                                 model.layers.N.mixer.fc1_latent_proj
+  Identity                                 model.layers.N.mixer.fc2_latent_proj
+  NemotronHTopkRouter                      model.layers.N.mixer.gate
+  Linear                                   model.layers.N.mixer.in_proj  in=2688 out=10304
+  Linear                                   model.layers.N.mixer.k_proj  in=2688 out=256
+  Zamba2RMSNormGated                       model.layers.N.mixer.norm
+  Linear                                   model.layers.N.mixer.o_proj  in=4096 out=2688
+  Linear                                   model.layers.N.mixer.out_proj  in=4096 out=2688
+  Linear                                   model.layers.N.mixer.q_proj  in=2688 out=4096
+  NemotronHMLP                             model.layers.N.mixer.shared_experts
+  ReLUSquaredActivation                    model.layers.N.mixer.shared_experts.act_fn
+  Linear                                   model.layers.N.mixer.shared_experts.down_proj  in=3712 out=2688
+  Linear                                   model.layers.N.mixer.shared_experts.up_proj  in=2688 out=3712
+  Linear                                   model.layers.N.mixer.v_proj  in=2688 out=256
+  NemotronHRMSNorm                         model.layers.N.norm
+  NemotronHRMSNorm                         model.norm_f

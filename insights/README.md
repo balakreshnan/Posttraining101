@@ -38,3 +38,28 @@ previewer) to see the charts.
 - Caveat shared with the 1.5B runs: eval problems are drawn from the same
   generator as training (small multiplication space), so 100% is partly
   in-distribution mastery rather than a strict held-out result.
+
+## Nemotron-3.5-Lightning-30B-A3B (BF16) -- pre-run artifacts
+
+- [`nemotron35_modules.txt`](nemotron35_modules.txt): `--list-modules`
+  output (meta-device build, no weights) captured before the first hecate
+  job (533496) was submitted. What it tells us:
+  - The installed `transformers` recognises `nemotron_h` -- no
+    architecture-support risk for this model.
+  - Every block is one of three mixers: `NemotronHMamba2Mixer`
+    (`in_proj` 2688->10304, `conv1d`, `out_proj` 4096->2688),
+    `NemotronHMoE` (router `gate` = `NemotronHTopkRouter`; experts are a
+    single fused `NemotronHExperts` module -- **not** `nn.Linear`, so
+    neither LoRA-by-name nor bitsandbytes would ever touch them; plus a
+    dense `shared_experts` MLP `up_proj`/`down_proj`), or
+    `NemotronHAttention` (`q_proj` 2688->4096, `k_proj`/`v_proj`
+    2688->256 = heavy GQA, `o_proj` 4096->2688).
+  - The default LoRA targets `q_proj,k_proj,v_proj,o_proj` therefore
+    match only the attention mixers ("select" layers). For more adapter
+    capacity the real names to add are the Mamba-2 `in_proj,out_proj`
+    and/or `shared_experts.up_proj,shared_experts.down_proj` (peft
+    matches by suffix, so `up_proj,down_proj` also works and hits only
+    the shared experts).
+  - `k_proj`/`v_proj` are tiny (out=256); most attention LoRA capacity
+    will sit in `q_proj`/`o_proj`.
+- Run dashboard/log: to be added once job 533496 completes.
