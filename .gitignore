@@ -223,3 +223,6 @@ rlvr/out/
 rlvr/*.log
 rlvr/logs/
 rlvr/.venv-upload/
+
+# Run logs deliberately kept for analysis (the template's global *.log rule above would hide them)
+!insights/*.log

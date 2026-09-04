@@ -1,0 +1,44 @@
+Loading nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 in bf16 (single process, device_map=single)...
+Loading weights: 100%|██████████| 401/401 [00:32<00:00, 12.21it/s]
+  GPU 0: 58.9 GiB allocated after load
+  GPU 1: 0.0 GiB allocated after load
+  GPU 2: 0.0 GiB allocated after load
+  GPU 3: 0.0 GiB allocated after load
+trainable params: 1,867,776 || all params: 31,579,805,120 || trainable%: 0.0059
+
+Rendered prompt for one example problem (enable_thinking=False, system_prompt=None):
+"<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is 760 - 20? You may reason briefly, but end your reply with exactly one line in the form 'Final Answer: <number>'.<|im_end|>\n<|im_start|>assistant\n<think></think>"
+
+Baseline accuracy before training:
+    eval sample (gold=-135, reward=1.0): '786 - 921 = -135\n\nFinal Answer: -135'
+  greedy accuracy = 100.00%
+
+Training: 10 optimizer steps x 4 rollout(s) of 1 prompt(s) each
+
+step   1/10 | mean_reward=1.000 | baseline=0.100 | grad_norm=0.742 | rollouts=4/4
+    sample (gold=1810, reward=1.0): 'Final Answer: 1810'
+step   2/10 | mean_reward=0.775 | baseline=0.168 | grad_norm=0.542 | rollouts=4/4
+    sample (gold=555, reward=0.1): 'To calculate 15 times 37, I can break it down using the distributive property: (10 + 5) × 37 = 10 × 37 + 5 × 37. This gives me 370 plus 185, which totals '
+step   3/10 | mean_reward=1.000 | baseline=0.251 | grad_norm=0.163 | rollouts=4/4
+    sample (gold=1269, reward=1.0): '27 * 47 = 27 * (50 - 3) = 1350 - 81 = 1269.\n\nFinal Answer: 1269'
+step   4/10 | mean_reward=0.775 | baseline=0.303 | grad_norm=0.131 | rollouts=4/4
+    sample (gold=84, reward=1.0): 'To find the product of 6 and 14, I multiply the two numbers:\n6 × 14 = 84.\n\nFinal Answer: 84'
+step   5/10 | mean_reward=1.000 | baseline=0.373 | grad_norm=0.164 | rollouts=4/4
+    sample (gold=376, reward=1.0): 'The difference is 376. \n\nFinal Answer: 376'
+step   6/10 | mean_reward=1.000 | baseline=0.436 | grad_norm=0.347 | rollouts=4/4
+    sample (gold=600, reward=1.0): '15 * 40 = 600\n\nFinal Answer: 600'
+step   7/10 | mean_reward=0.775 | baseline=0.470 | grad_norm=0.069 | rollouts=4/4
+    sample (gold=505, reward=1.0): '307 + 198 = 505\n\nFinal Answer: 505'
+step   8/10 | mean_reward=0.775 | baseline=0.500 | grad_norm=0.075 | rollouts=4/4
+    sample (gold=1490, reward=1.0): '705 + 785 = 1490\n\nFinal Answer: 1490'
+step   9/10 | mean_reward=0.775 | baseline=0.528 | grad_norm=0.052 | rollouts=4/4
+    sample (gold=135, reward=1.0): '867 - 732 = 135\n\nFinal Answer: 135'
+step  10/10 | mean_reward=1.000 | baseline=0.575 | grad_norm=0.094 | rollouts=4/4
+    sample (gold=570, reward=1.0): '19 * 30 can be calculated as 19 * (3 * 10) = (19 * 3) * 10. Since 19 * 3 equals 57, multiplying by 10 gives 570.\n\nFinal Answer: 570'
+
+Step accounting: {'updated': 10, 'skipped_logits': 0, 'skipped_grad': 0, 'rollbacks': 0}
+
+Accuracy after training:
+    eval sample (gold=-44, reward=1.0): '611 - 655 = -44\n\nFinal Answer: -44'
+  greedy accuracy = 100.00% (baseline was 100.00%)
+Saved LoRA adapter to /lustre/fsw/general_sa/bbalakreshna/out/rlvr-nemotron-run1

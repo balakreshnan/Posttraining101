@@ -62,4 +62,27 @@ previewer) to see the charts.
     the shared experts).
   - `k_proj`/`v_proj` are tiny (out=256); most attention LoRA capacity
     will sit in `q_proj`/`o_proj`.
-- Run dashboard/log: to be added once job 533496 completes.
+- [`hecate_nemotron_10step.log`](hecate_nemotron_10step.log) and
+  [`hecate_nemotron_10step_dashboard.html`](hecate_nemotron_10step_dashboard.html):
+  job 533496, the first Nemotron run on hecate (10 optimizer steps x 4
+  single-prompt rollouts, LoRA on attention projections, whole bf16 model
+  on one GPU). Clean on every check:
+  - `nemotron_h` loaded (401 shards in 32 s); **58.9 GiB on GPU 0**, GPUs
+    1-3 empty -- the single-GPU design working as intended.
+  - Rendered prompt ends in an **empty `<think></think>`** block: this
+    template honours `enable_thinking=False` (that is how "thinking off"
+    is rendered), so no system-prompt workaround is needed.
+  - `trainable params: 1,867,776 / 31.6B (0.0059%)` -- small because only
+    the "select" attention mixers carry LoRA and `k_proj`/`v_proj` are
+    tiny (out=256).
+  - `Step accounting: updated 10, skipped_logits 0, skipped_grad 0,
+    rollbacks 0`; grad norm 0.74 -> 0.05-0.09 as the baseline rose.
+  - **Baseline greedy accuracy 100%, final 100%.** The model already
+    solves the arithmetic task before any training. The sampled-rollout
+    rewards of 0.775 are verbose answers truncated at `--max-new-tokens
+    64` (e.g. the step-2 sample is cut off mid-explanation), not wrong
+    arithmetic. On this task the only thing RLVR can teach this model is
+    brevity -- a formatting signal, not a capability gain. A meaningful
+    1000-step run needs a harder verifiable task first (larger operands
+    / multi-step expressions in `task.py`, or a real dataset such as
+    GSM8K).
