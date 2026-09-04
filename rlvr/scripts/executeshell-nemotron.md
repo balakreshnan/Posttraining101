@@ -390,7 +390,16 @@ def main() -> None:
         device = model.device
     model.config.use_cache = False  # training forward; generate() passes use_cache=True
 
-    if is_main:
+    # memory_allocated() is per-PROCESS: under DDP rank 0 sees only its own GPU
+    # and would print 0 for the others. Gather each rank's own number instead.
+    if distributed:
+        mine = (local_rank, torch.cuda.memory_allocated(device) / 2**30)
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, mine)
+        if is_main:
+            for gpu, gib in sorted(gathered):
+                print(f"  GPU {gpu}: {gib:.1f} GiB allocated after load (rank-local replica)")
+    elif is_main:
         for i in range(torch.cuda.device_count()):
             print(f"  GPU {i}: {torch.cuda.memory_allocated(i) / 2**30:.1f} GiB allocated after load")
 
