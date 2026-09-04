@@ -3,9 +3,12 @@
 RLVR fine-tuning of NVIDIA's
 [Nemotron-3.5-Lightning-30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4)
 (30B total / 3B active; Mamba-2 + MoE + attention hybrid, architecture
-`nemotron_h`) on the same arithmetic task as the other guides, using
-[`train_rlvr_nemotron.py`](../train_rlvr_nemotron.py) -- an adaptation of
-the Qwen3.8 script that keeps every stability guard learned there.
+`nemotron_h`) using [`train_rlvr_nemotron.py`](../train_rlvr_nemotron.py)
+-- an adaptation of the Qwen3.8 script that keeps every stability guard
+learned there. Two tasks: the synthetic arithmetic shared with the other
+guides (`--task arith`; this model already scores 100% on it) and
+**GSM8K** (`--task gsm8k`, the launcher default -- see section 7), real
+word problems with a held-out test-split eval.
 
 **Use the BF16 checkpoint for training** (`...-30B-A3B-BF16`, ~60GB). The
 NVFP4 sibling is a ModelOpt-quantised *inference* artifact (vLLM/SGLang,
@@ -30,8 +33,10 @@ What is different from the Qwen3.8 flow, and why:
   `RLVR_SYSTEM_PROMPT="/no_think"` (or whatever the model card specifies).
 
 Verified locally on the identical code path with Qwen2.5-1.5B-Instruct
-(3 steps x 2 rollouts: 0% -> 75%, all guards clean, adapter saved). Not
-yet run against the Nemotron checkpoint on hecate.
+(arith: 3 steps x 2 rollouts, 0% -> 75%; gsm8k: 2 steps x 2 rollouts,
+held-out 33% -> 67% on 3 problems; all guards clean, adapters saved).
+On hecate: the arith 10-step run (job 533496) completed cleanly at 100%
+baseline -- see [`../../insights/`](../../insights/); GSM8K not yet run.
 
 ## 1. Download the model weights
 
@@ -110,9 +115,15 @@ Guards (from the Qwen3.8 experience):
   - the adapter is only saved when finite; a `Step accounting` line
     summarises updated / skipped / rollback counts.
 
+Tasks (--task): 'arith' is task.py's synthetic arithmetic -- this model
+already scores 100% on it, so it can only learn brevity. 'gsm8k' (see
+gsm8k_task.py) samples rollouts from the openai/gsm8k TRAIN split and
+evaluates on the held-out TEST split; use --max-new-tokens 256-512 so
+step-by-step solutions are not truncated (truncated == 0.1 reward).
+
 Usage:
-    python train_rlvr_nemotron.py --iterations 10
-    torchrun --standalone --nproc_per_node=4 train_rlvr_nemotron.py --iterations 1000
+    python train_rlvr_nemotron.py --task gsm8k --iterations 10 --max-new-tokens 384
+    torchrun --standalone --nproc_per_node=4 train_rlvr_nemotron.py --task gsm8k --iterations 1000
 
 Log lines are the same shape as train_rlvr_qwen38.py's, so analyze_run.py
 and generate_dashboard.py work on the output unchanged.
@@ -146,6 +157,13 @@ DEFAULT_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RLVR LoRA fine-tuning for Nemotron-3.5-Lightning (BF16)")
     p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument(
+        "--task", choices=["arith", "gsm8k"], default="arith",
+        help="'arith': task.py's synthetic arithmetic (eval draws from the same generator as "
+             "training). 'gsm8k': real grade-school word problems from openai/gsm8k -- rollouts "
+             "from the train split, eval from the held-out TEST split. Needs `datasets` and a "
+             "reasoning-sized --max-new-tokens (256-512).",
+    )
     p.add_argument("--iterations", type=int, default=10, help="Optimizer steps.")
     p.add_argument(
         "--batch-size", type=int, default=1,
@@ -275,20 +293,20 @@ def _any_rank(flag: bool, distributed: bool, device) -> bool:
 
 
 @torch.no_grad()
-def _greedy_eval(gen_model, tokenizer, device, rng, args, n):
-    problems = sample_batch(rng, n)
+def _greedy_eval(gen_model, tokenizer, device, rng, args, n, sampler, verify):
+    problems = sampler(rng, n)
     correct = 0
     nonfinite = 0
     for i, prob in enumerate(problems):
         enc = tokenizer(build_prompt(tokenizer, prob, args), return_tensors="pt").to(device)
         if not _logits_finite(gen_model, enc):
             nonfinite += 1
-            print(f"  eval problem {i}: NON-FINITE logits for prompt {prob['question']!r} -- skipping")
+            print(f"  eval problem {i}: NON-FINITE logits for prompt {prob['question'][:80]!r}... -- skipping")
             continue
         out = gen_model.generate(**enc, max_new_tokens=args.max_new_tokens, do_sample=False,
                                  use_cache=True, pad_token_id=tokenizer.pad_token_id)
         completion = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
-        reward = verify_reward(completion, prob["answer"])
+        reward = verify(completion, prob["answer"])
         if i == 0:
             _show(f"eval sample (gold={prob['answer']}, reward={reward})", completion, args.print_completion_chars)
         if reward == 1.0:
@@ -314,6 +332,20 @@ def main() -> None:
 
     rng = random.Random(args.seed + rank)  # ranks see different problems
     torch.manual_seed(args.seed + rank)
+
+    # Task backend: where rollout problems come from, where eval problems come
+    # from, and how a completion is scored.
+    if args.task == "gsm8k":
+        from gsm8k_task import GSM8K, verify_reward as gsm8k_verify
+        gsm8k = GSM8K()
+        train_sampler, eval_sampler, verify = gsm8k.sample_train, gsm8k.sample_eval, gsm8k_verify
+        if is_main:
+            print(gsm8k.describe())
+            if args.max_new_tokens < 192:
+                print(f"note: --max-new-tokens {args.max_new_tokens} is small for GSM8K reasoning; "
+                      f"256-512 is typical. Truncated-but-correct solutions score 0.1, not 1.0.")
+    else:
+        train_sampler, eval_sampler, verify = sample_batch, sample_batch, verify_reward
 
     if not torch.cuda.is_available():
         raise SystemExit("This script requires CUDA GPUs.")
@@ -374,11 +406,12 @@ def main() -> None:
     last_good = _snapshot(trainable_params)
 
     if is_main:
-        example = sample_batch(random.Random(args.seed + 12345), 1)[0]
+        example = train_sampler(random.Random(args.seed + 12345), 1)[0]
         print(f"\nRendered prompt for one example problem ({args.thinking_kwarg}={args.enable_thinking}, "
               f"system_prompt={args.system_prompt!r}):\n{build_prompt(tokenizer, example, args)!r}\n")
-        print("Baseline accuracy before training:")
-        baseline_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n)
+        print(f"Baseline accuracy before training ({args.eval_n} eval problems):")
+        baseline_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n,
+                                    sampler=eval_sampler, verify=verify)
         print(f"  greedy accuracy = {baseline_acc:.2%}")
         print(f"\nTraining: {args.iterations} optimizer steps x {args.grad_accum} rollout(s) of "
               f"{args.batch_size} prompt(s) each" + (f" x {world_size} ranks" if distributed else "") + "\n")
@@ -394,7 +427,7 @@ def main() -> None:
         first_completion = first_problem = None
 
         for _ in range(args.grad_accum):
-            problems = sample_batch(rng, args.batch_size)
+            problems = train_sampler(rng, args.batch_size)
             prompts = [build_prompt(tokenizer, p, args) for p in problems]
             enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
             prompt_len = enc["input_ids"].shape[1]
@@ -414,7 +447,7 @@ def main() -> None:
             rewards = []
             for i, prob in enumerate(problems):
                 completion = tokenizer.decode(gen_out[i][prompt_len:], skip_special_tokens=True)
-                rewards.append(verify_reward(completion, prob["answer"]))
+                rewards.append(verify(completion, prob["answer"]))
                 if first_completion is None:
                     first_completion, first_problem = completion, prob
             step_rewards.extend(rewards)
@@ -490,8 +523,9 @@ def main() -> None:
 
     if is_main:
         print(f"\nStep accounting: {stats}")
-        print("\nAccuracy after training:")
-        final_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n)
+        print(f"\nAccuracy after training ({args.eval_n} eval problems):")
+        final_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n,
+                                 sampler=eval_sampler, verify=verify)
         print(f"  greedy accuracy = {final_acc:.2%} (baseline was {baseline_acc:.2%})")
         if args.save_dir:
             if _params_finite(trainable_params):
@@ -510,6 +544,119 @@ if __name__ == "__main__":
     main()
 PYEOF
 
+cat > "$LUSTRE_DIR/gsm8k_task.py" << 'GSMEOF'
+"""GSM8K as a verifiable-reward task for RLVR.
+
+Drop-in alternative to task.py's synthetic arithmetic. Same interface the
+training scripts use -- problems are dicts with "question" and "answer",
+and a reward function scores a completion against the gold answer -- but:
+
+  - Problems come from the real dataset (openai/gsm8k, config "main"):
+    grade-school word problems whose gold answers are exact numbers.
+  - TRAIN rollouts sample the 7,473-problem train split; EVAL samples the
+    1,319-problem TEST split. That makes the eval a genuine held-out
+    measurement, unlike task.py where eval draws from the same generator
+    as training.
+  - Gold answers are parsed from the "#### <number>" line of the dataset's
+    solution text (commas stripped; all GSM8K golds are integers).
+  - Completions are normalised (commas and $ removed) before the same
+    "Final Answer: <number>"-first / last-number-fallback extraction as
+    task.py, and compared numerically so "18", "18.0" and "18.00" match.
+    Rewards: 1.0 correct, 0.1 for any parseable number (format credit),
+    0.0 otherwise.
+
+The dataset is fetched via `datasets` on first use and cached under
+$HF_HOME (hecate: $LUSTRE_DIR/hf_cache). To pre-fetch:
+    hf download openai/gsm8k --repo-type dataset
+"""
+
+import re
+
+_GOLD_RE = re.compile(r"####\s*(-?[\d,]*\.?\d+)")
+_FINAL_ANSWER_RE = re.compile(r"Final Answer:\s*(-?\d*\.?\d+)", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"-?\d*\.?\d+")
+
+INSTRUCTION = (
+    " Solve this step by step, then end your reply with exactly one line "
+    "in the form 'Final Answer: <number>'."
+)
+
+
+def _to_number(s: str):
+    s = s.replace(",", "").replace("$", "").strip().rstrip(".")
+    if not s:
+        return None
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return int(f) if f == int(f) else f
+
+
+def parse_gold(solution_text: str):
+    m = _GOLD_RE.search(solution_text)
+    if not m:
+        return None
+    return _to_number(m.group(1))
+
+
+def extract_answer(completion_text: str):
+    text = completion_text.replace(",", "").replace("$", "")
+    m = _FINAL_ANSWER_RE.search(text)
+    if m:
+        return _to_number(m.group(1))
+    nums = _NUMBER_RE.findall(text)
+    return _to_number(nums[-1]) if nums else None
+
+
+def verify_reward(completion_text: str, gold_answer) -> float:
+    predicted = extract_answer(completion_text)
+    if predicted is None:
+        return 0.0
+    try:
+        if abs(float(predicted) - float(gold_answer)) < 1e-6:
+            return 1.0
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.1
+
+
+class GSM8K:
+    """Holds both splits in memory (a few MB) and samples from them."""
+
+    def __init__(self, train_split: str = "train", eval_split: str = "test"):
+        try:
+            from datasets import load_dataset
+        except ImportError as e:
+            raise SystemExit("`datasets` is required for --task gsm8k (pip install datasets)") from e
+
+        ds = load_dataset("openai/gsm8k", "main")
+        self.train = self._prepare(ds[train_split])
+        self.eval = self._prepare(ds[eval_split])
+        self.train_split, self.eval_split = train_split, eval_split
+
+    @staticmethod
+    def _prepare(split):
+        problems = []
+        for row in split:
+            gold = parse_gold(row["answer"])
+            if gold is None:
+                continue  # a handful of malformed rows, if any
+            problems.append({"question": row["question"].strip() + INSTRUCTION, "answer": gold})
+        return problems
+
+    def describe(self) -> str:
+        return (f"GSM8K: {len(self.train)} train problems ({self.train_split} split) for rollouts, "
+                f"{len(self.eval)} held-out problems ({self.eval_split} split) for eval")
+
+    def sample_train(self, rng, n: int) -> list[dict]:
+        return [rng.choice(self.train) for _ in range(n)]
+
+    def sample_eval(self, rng, n: int) -> list[dict]:
+        # Without replacement so the eval set is n distinct problems.
+        return rng.sample(self.eval, min(n, len(self.eval)))
+GSMEOF
+
 cat > "$LUSTRE_DIR/requirements-nemotron.txt" << 'REQEOF'
 # For train_rlvr_nemotron.py inside the gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel
 # container. The container's torch/CUDA is reused (not reinstalled). No bitsandbytes: the
@@ -519,6 +666,7 @@ cat > "$LUSTRE_DIR/requirements-nemotron.txt" << 'REQEOF'
 transformers>=4.57
 accelerate>=1.0
 peft>=0.13
+datasets>=2.20   # --task gsm8k (openai/gsm8k, cached under $HF_HOME)
 REQEOF
 
 cat > "$LUSTRE_DIR/scripts/launch_rlvr_nemotron.sh" << 'SHEOF'
@@ -538,18 +686,30 @@ mkdir -p "$HF_HOME"
 # Guards in the script make the CUDA assert unreachable; keep launches async for speed.
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 
+# Task: 'arith' (task.py synthetic arithmetic -- this model already scores 100%, so it
+# only learns brevity) or 'gsm8k' (real word problems, held-out test-split eval).
+TASK="${RLVR_TASK:-gsm8k}"
+if [ "$TASK" = "gsm8k" ]; then
+  DEFAULT_TOKENS=384   # step-by-step reasoning needs room; truncated solutions score 0.1
+  RUN_NAME="${RLVR_RUN_NAME:-rlvr-nemotron-gsm8k-run1}"
+else
+  DEFAULT_TOKENS=64
+  RUN_NAME="${RLVR_RUN_NAME:-rlvr-nemotron-run1}"
+fi
+
 COMMON_ARGS=(
   --model "${RLVR_MODEL:-nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16}"
+  --task "$TASK"
   --iterations "${RLVR_ITERATIONS:-10}"
   --batch-size "${RLVR_BATCH_SIZE:-1}"
   --grad-accum "${RLVR_GRAD_ACCUM:-4}"
-  --max-new-tokens "${RLVR_MAX_NEW_TOKENS:-64}"
+  --max-new-tokens "${RLVR_MAX_NEW_TOKENS:-$DEFAULT_TOKENS}"
   --lr "${RLVR_LR:-1e-5}"
-  --eval-n "${RLVR_EVAL_N:-10}"
+  --eval-n "${RLVR_EVAL_N:-30}"
   --lora-r "${RLVR_LORA_R:-16}"
-  --lora-target-modules "${RLVR_LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj}"
+  --lora-target-modules "${RLVR_LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj,in_proj,out_proj}"
   --seed "${RLVR_SEED:-0}"
-  --save-dir "$LUSTRE_DIR/out/rlvr-nemotron-run1"
+  --save-dir "$LUSTRE_DIR/out/$RUN_NAME"
 )
 # Optional: a system prompt for templates that toggle reasoning that way (e.g. "/no_think").
 if [ -n "${RLVR_SYSTEM_PROMPT:-}" ]; then
@@ -558,12 +718,12 @@ fi
 
 NPROC="${RLVR_NPROC:-1}"
 if [ "$NPROC" -gt 1 ]; then
-  # Data-parallel: one full bf16 replica per GPU (~60GB each). UNTESTED path -- use
-  # only after the single-process default has completed a run cleanly.
-  echo "$(hostname): Launching RLVR fine-tuning for Nemotron-3.5-Lightning via torchrun x$NPROC (DDP)..."
+  # Data-parallel: one full bf16 replica per GPU (~60GB each). Guards are synchronised
+  # across ranks. Not yet exercised on multi-GPU -- complete a single-process run first.
+  echo "$(hostname): Launching RLVR ($TASK) for Nemotron-3.5-Lightning via torchrun x$NPROC (DDP)..."
   torchrun --standalone --nproc_per_node="$NPROC" "$LUSTRE_DIR/train_rlvr_nemotron.py" "${COMMON_ARGS[@]}"
 else
-  echo "$(hostname): Launching RLVR fine-tuning for Nemotron-3.5-Lightning (single process, one GPU)..."
+  echo "$(hostname): Launching RLVR ($TASK) for Nemotron-3.5-Lightning (single process, one GPU)..."
   python "$LUSTRE_DIR/train_rlvr_nemotron.py" --device-map "${RLVR_DEVICE_MAP:-single}" "${COMMON_ARGS[@]}"
 fi
 SHEOF
@@ -788,3 +948,94 @@ Section 5 (1000 steps; optional `RLVR_NPROC=4` DDP) and section 6
 (`analyze_run.py` / `generate_dashboard.py`) apply unchanged. To refresh
 the code after a repo update, re-run block B -- `curl` overwrites in
 place.
+
+## 7. GSM8K: the real task, 1000 steps
+
+The first Nemotron run (job 533496, see [`../../insights/`](../../insights/))
+scored **100% at baseline** on the synthetic arithmetic -- there was
+nothing left to learn, and the only signal was truncation of verbose
+answers. GSM8K (grade-school word problems, exact numeric golds) has real
+headroom for a 30B model and, crucially, a genuine **held-out eval**:
+rollouts sample the 7,473-problem *train* split, eval samples the
+1,319-problem *test* split. `gsm8k_task.py` provides it; `--task gsm8k`
+selects it; the launcher now defaults to it (`RLVR_TASK=arith` to go back).
+
+Verified locally on the identical code path with Qwen2.5-1.5B-Instruct:
+dataset load, gold parsing, `$`/comma normalisation, 2 steps x 2 rollouts
+(held-out eval 33% -> 67% on 3 problems -- tiny n, but the pipeline works).
+
+### A. Fetch the updated code (repo is public; hecate has internet)
+
+```bash
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
+RAW="https://raw.githubusercontent.com/balakreshnan/Posttraining101/main/rlvr"
+
+curl -fsSL "$RAW/train_rlvr_nemotron.py"          -o "$LUSTRE_DIR/train_rlvr_nemotron.py"
+curl -fsSL "$RAW/gsm8k_task.py"                   -o "$LUSTRE_DIR/gsm8k_task.py"
+curl -fsSL "$RAW/requirements-nemotron.txt"       -o "$LUSTRE_DIR/requirements-nemotron.txt"
+curl -fsSL "$RAW/scripts/launch_rlvr_nemotron.sh" -o "$LUSTRE_DIR/scripts/launch_rlvr_nemotron.sh"
+chmod +x "$LUSTRE_DIR/scripts/launch_rlvr_nemotron.sh"
+
+grep -c "gsm8k" "$LUSTRE_DIR/train_rlvr_nemotron.py"   # expect > 0 (confirms the current version)
+```
+
+### B. Pre-fetch the dataset (optional; ~4MB, otherwise fetched on first use inside the job)
+
+```bash
+source "$LUSTRE_DIR/.venv-upload/bin/activate"
+HF_HOME="$LUSTRE_DIR/hf_cache" hf download openai/gsm8k --repo-type dataset
+deactivate
+```
+
+### C. Short run first (10 steps), then 1000
+
+```bash
+# keep the arithmetic run's log
+mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"    "$LUSTRE_DIR/out/hecate_nemotron_arith_10step.log"    2>/dev/null
+mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.timing" "$LUSTRE_DIR/out/hecate_nemotron_arith_10step.timing" 2>/dev/null
+
+# 10-step GSM8K check: single GPU, 384 new tokens, 30 held-out eval problems
+bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+tail -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"
+```
+
+Read: `GSM8K: 7473 train problems ... 1319 held-out problems`; the
+`Rendered prompt` (a word problem + the Final Answer instruction, ending in
+`<think></think>`); `Baseline accuracy` on 30 test problems -- expect well
+below 100% this time; `Step accounting` with `updated` ~10; and the
+timing file's elapsed seconds, which sizes the long run.
+
+```bash
+cat "$LUSTRE_DIR/out/hecate_nemotron_run1.timing"
+mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"    "$LUSTRE_DIR/out/hecate_nemotron_gsm8k_10step.log"
+mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.timing" "$LUSTRE_DIR/out/hecate_nemotron_gsm8k_10step.timing"
+
+# 1000 steps x 4 rollouts, single GPU
+RLVR_ITERATIONS=1000 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=50 bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+```
+
+**Time budget.** 384-token rollouts are ~6x longer than the arithmetic
+run's, so budget ~30-40 s per optimizer step on one GPU -- 1000 steps is
+~8-11 h, over the 5 h `batch-xdr` limit and the adapter is only saved at
+the end. Two ways to fit:
+
+```bash
+# (a) 8-hour backfill partition, 600 steps  -- single GPU, proven path
+sed -i 's/--partition=batch-xdr/--partition=backfill-xdr/; s/--time=5:00:00/--time=8:00:00/' "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+RLVR_ITERATIONS=600 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=50 bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+
+# (b) all 4 GPUs as DDP replicas: ~4x throughput, 1000 steps in ~2-3 h -- untested path
+RLVR_NPROC=4 RLVR_ITERATIONS=1000 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=50 bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+```
+
+Use the 10-step timing to decide: (elapsed - ~3 min load/eval) / 10 =
+seconds per step; multiply by 1000.
+
+### D. What the launcher changed for GSM8K
+
+`RLVR_TASK` defaults to `gsm8k`; `--max-new-tokens` defaults to 384 (64 for
+arith); `--eval-n` defaults to 30; the adapter is saved to
+`out/rlvr-nemotron-gsm8k-run1`; and LoRA now also covers the Mamba-2
+projections (`q_proj,k_proj,v_proj,o_proj,in_proj,out_proj`, names from the
+module inventory) so the adapter has more than the "select" attention
+layers to work with. All overridable via the same `RLVR_*` variables.

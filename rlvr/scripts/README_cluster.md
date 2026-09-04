@@ -30,7 +30,9 @@ blocks see:
 - [`executeshell-nemotron.md`](executeshell-nemotron.md) — LoRA
   fine-tuning of NVIDIA Nemotron-3.5-Lightning-30B-A3B (BF16, ~60GB, fits
   on one GPU; optional 4-replica DDP). Same guards as the Qwen3.8 flow.
-  Code path verified locally with a small model; not yet run on hecate
+  Arithmetic 10-step run completed cleanly on hecate at 100% baseline
+  (task saturated); section 7 switches to **GSM8K** (`gsm8k_task.py`,
+  held-out test-split eval) for the 1000-step run
 
 ## 1. Write the code to Lustre
 

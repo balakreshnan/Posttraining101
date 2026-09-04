@@ -38,9 +38,15 @@ Guards (from the Qwen3.8 experience):
   - the adapter is only saved when finite; a `Step accounting` line
     summarises updated / skipped / rollback counts.
 
+Tasks (--task): 'arith' is task.py's synthetic arithmetic -- this model
+already scores 100% on it, so it can only learn brevity. 'gsm8k' (see
+gsm8k_task.py) samples rollouts from the openai/gsm8k TRAIN split and
+evaluates on the held-out TEST split; use --max-new-tokens 256-512 so
+step-by-step solutions are not truncated (truncated == 0.1 reward).
+
 Usage:
-    python train_rlvr_nemotron.py --iterations 10
-    torchrun --standalone --nproc_per_node=4 train_rlvr_nemotron.py --iterations 1000
+    python train_rlvr_nemotron.py --task gsm8k --iterations 10 --max-new-tokens 384
+    torchrun --standalone --nproc_per_node=4 train_rlvr_nemotron.py --task gsm8k --iterations 1000
 
 Log lines are the same shape as train_rlvr_qwen38.py's, so analyze_run.py
 and generate_dashboard.py work on the output unchanged.
@@ -74,6 +80,13 @@ DEFAULT_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RLVR LoRA fine-tuning for Nemotron-3.5-Lightning (BF16)")
     p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument(
+        "--task", choices=["arith", "gsm8k"], default="arith",
+        help="'arith': task.py's synthetic arithmetic (eval draws from the same generator as "
+             "training). 'gsm8k': real grade-school word problems from openai/gsm8k -- rollouts "
+             "from the train split, eval from the held-out TEST split. Needs `datasets` and a "
+             "reasoning-sized --max-new-tokens (256-512).",
+    )
     p.add_argument("--iterations", type=int, default=10, help="Optimizer steps.")
     p.add_argument(
         "--batch-size", type=int, default=1,
@@ -203,20 +216,20 @@ def _any_rank(flag: bool, distributed: bool, device) -> bool:
 
 
 @torch.no_grad()
-def _greedy_eval(gen_model, tokenizer, device, rng, args, n):
-    problems = sample_batch(rng, n)
+def _greedy_eval(gen_model, tokenizer, device, rng, args, n, sampler, verify):
+    problems = sampler(rng, n)
     correct = 0
     nonfinite = 0
     for i, prob in enumerate(problems):
         enc = tokenizer(build_prompt(tokenizer, prob, args), return_tensors="pt").to(device)
         if not _logits_finite(gen_model, enc):
             nonfinite += 1
-            print(f"  eval problem {i}: NON-FINITE logits for prompt {prob['question']!r} -- skipping")
+            print(f"  eval problem {i}: NON-FINITE logits for prompt {prob['question'][:80]!r}... -- skipping")
             continue
         out = gen_model.generate(**enc, max_new_tokens=args.max_new_tokens, do_sample=False,
                                  use_cache=True, pad_token_id=tokenizer.pad_token_id)
         completion = tokenizer.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
-        reward = verify_reward(completion, prob["answer"])
+        reward = verify(completion, prob["answer"])
         if i == 0:
             _show(f"eval sample (gold={prob['answer']}, reward={reward})", completion, args.print_completion_chars)
         if reward == 1.0:
@@ -242,6 +255,20 @@ def main() -> None:
 
     rng = random.Random(args.seed + rank)  # ranks see different problems
     torch.manual_seed(args.seed + rank)
+
+    # Task backend: where rollout problems come from, where eval problems come
+    # from, and how a completion is scored.
+    if args.task == "gsm8k":
+        from gsm8k_task import GSM8K, verify_reward as gsm8k_verify
+        gsm8k = GSM8K()
+        train_sampler, eval_sampler, verify = gsm8k.sample_train, gsm8k.sample_eval, gsm8k_verify
+        if is_main:
+            print(gsm8k.describe())
+            if args.max_new_tokens < 192:
+                print(f"note: --max-new-tokens {args.max_new_tokens} is small for GSM8K reasoning; "
+                      f"256-512 is typical. Truncated-but-correct solutions score 0.1, not 1.0.")
+    else:
+        train_sampler, eval_sampler, verify = sample_batch, sample_batch, verify_reward
 
     if not torch.cuda.is_available():
         raise SystemExit("This script requires CUDA GPUs.")
@@ -302,11 +329,12 @@ def main() -> None:
     last_good = _snapshot(trainable_params)
 
     if is_main:
-        example = sample_batch(random.Random(args.seed + 12345), 1)[0]
+        example = train_sampler(random.Random(args.seed + 12345), 1)[0]
         print(f"\nRendered prompt for one example problem ({args.thinking_kwarg}={args.enable_thinking}, "
               f"system_prompt={args.system_prompt!r}):\n{build_prompt(tokenizer, example, args)!r}\n")
-        print("Baseline accuracy before training:")
-        baseline_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n)
+        print(f"Baseline accuracy before training ({args.eval_n} eval problems):")
+        baseline_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n,
+                                    sampler=eval_sampler, verify=verify)
         print(f"  greedy accuracy = {baseline_acc:.2%}")
         print(f"\nTraining: {args.iterations} optimizer steps x {args.grad_accum} rollout(s) of "
               f"{args.batch_size} prompt(s) each" + (f" x {world_size} ranks" if distributed else "") + "\n")
@@ -322,7 +350,7 @@ def main() -> None:
         first_completion = first_problem = None
 
         for _ in range(args.grad_accum):
-            problems = sample_batch(rng, args.batch_size)
+            problems = train_sampler(rng, args.batch_size)
             prompts = [build_prompt(tokenizer, p, args) for p in problems]
             enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
             prompt_len = enc["input_ids"].shape[1]
@@ -342,7 +370,7 @@ def main() -> None:
             rewards = []
             for i, prob in enumerate(problems):
                 completion = tokenizer.decode(gen_out[i][prompt_len:], skip_special_tokens=True)
-                rewards.append(verify_reward(completion, prob["answer"]))
+                rewards.append(verify(completion, prob["answer"]))
                 if first_completion is None:
                     first_completion, first_problem = completion, prob
             step_rewards.extend(rewards)
@@ -418,8 +446,9 @@ def main() -> None:
 
     if is_main:
         print(f"\nStep accounting: {stats}")
-        print("\nAccuracy after training:")
-        final_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n)
+        print(f"\nAccuracy after training ({args.eval_n} eval problems):")
+        final_acc = _greedy_eval(gen_model, tokenizer, device, rng, args, n=args.eval_n,
+                                 sampler=eval_sampler, verify=verify)
         print(f"  greedy accuracy = {final_acc:.2%} (baseline was {baseline_acc:.2%})")
         if args.save_dir:
             if _params_finite(trainable_params):

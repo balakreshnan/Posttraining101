@@ -6,3 +6,4 @@
 transformers>=4.57
 accelerate>=1.0
 peft>=0.13
+datasets>=2.20   # --task gsm8k (openai/gsm8k, cached under $HF_HOME)
