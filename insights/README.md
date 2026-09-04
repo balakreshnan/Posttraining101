@@ -10,6 +10,7 @@ previewer) to see the charts.
 | File | Run | Key numbers |
 |---|---|---|
 | [`hecate_qwen38_run1_dashboard.html`](hecate_qwen38_run1_dashboard.html) | Qwen3.8-Flash-Next, LoRA on attention projections, bf16 base sharded across a 4-GPU Vera Rubin node, 1000 optimizer steps x 4 accumulated single-prompt rollouts (`train_rlvr_qwen38.py`, hecate) | Greedy accuracy **20% -> 100%**. Step accounting: 689 updated, **311 skipped for non-finite gradient**, 0 skipped for non-finite logits, **0 adapter rollbacks**. Wall time 05:17:08 incl. queue wait. |
+| [`hecate_nemotron_gsm8k_1000step_dashboard.html`](hecate_nemotron_gsm8k_1000step_dashboard.html) (log: [`hecate_nemotron_gsm8k_1000step.log`](hecate_nemotron_gsm8k_1000step.log)) | Nemotron-3.5-Lightning-30B-A3B (BF16), **GSM8K**, 4-rank DDP (one full replica per GPU), LoRA on `q/k/v/o_proj,in_proj`, 1000 optimizer steps x 4 single-prompt rollouts, 384 new tokens, 50-problem held-out evals (`train_rlvr_nemotron.py`, hecate job 533869) | Held-out test accuracy **94.0% -> 90.0%** (47 -> 45 of 50: inside the noise floor of a 50-problem eval). Step accounting: **1000 updated, 0 / 0 / 0** -- no guard ever fired. Wall time 02:23:54 (~8 steps/min). |
 
 ## Reading the Qwen3.8 dashboard
 
@@ -102,6 +103,38 @@ previewer) to see the charts.
   strong on GSM8K (~93-94% baseline), so headroom is a few points, not
   tens; and most 0.1 rewards are correct-looking solutions truncated at
   384 tokens, not wrong answers -- `RLVR_MAX_NEW_TOKENS=640` is the lever
-  if that should stop being penalised. The 1000-step DDP run (job 533869,
-  4 x 1 rollout, 50-problem evals, baseline 94.0%) is in flight; its log
-  and dashboard will be added here when it finishes.
+  if that should stop being penalised.
+- **GSM8K, 1000-step DDP run (job 533869):**
+  [`hecate_nemotron_gsm8k_1000step.log`](hecate_nemotron_gsm8k_1000step.log)
+  and [`hecate_nemotron_gsm8k_1000step_dashboard.html`](hecate_nemotron_gsm8k_1000step_dashboard.html).
+  Same configuration as the 100-step validation, scaled to 1000 steps with
+  50-problem evals. How to read the dashboard:
+  - **Throughput: ~8 steps/min, 02:23:54 wall** for load + 1000 steps +
+    two evals. Faster than the ~12 s/step estimated from the 100-step run,
+    so the 5 h `batch-xdr` limit had ~2.5 h of headroom.
+  - **Step accounting `1000 / 0 / 0 / 0`.** Nemotron in bf16 never produced a
+    non-finite gradient in 1000 steps (contrast Qwen3.8: 311 guarded
+    steps). The skipped-step histogram is therefore empty by design.
+  - **Reward: flat at 1.0 with 72 dips to 0.1 (7.2% of steps).** The dips
+    are mostly correct-looking solutions cut off at 384 tokens plus a few
+    genuine mistakes. Each time the running baseline reaches ~1.0 the
+    advantage of a correct rollout is ~0 and `grad_norm` collapses to
+    ~0.005; the next 0.1 dip then delivers a large negative-advantage
+    update. In other words the dominant learning signal in this run was
+    "avoid answers that run past 384 tokens", not "be more correct".
+  - **Held-out accuracy 94.0% -> 90.0%** is 47 -> 45 of 50. One problem
+    is 2 points, so this is inside the eval's noise floor and should be
+    read as "no measurable change", not a regression. The visible
+    post-training eval sample scored 0.1 for being truncated mid-solution,
+    so part of the delta is the truncation penalty biting on eval rather
+    than wrong arithmetic. The model was already at ~94% before training;
+    the headroom on GSM8K for this model is a few points at most.
+  - **GPU memory line `58.9 / 0 / 0 / 0 GiB`** is the rank-0 process's
+    view only (each rank holds its own ~59 GiB replica; `nvidia-smi` during
+    the run showed 75-79 GiB used on all four GPUs). The all-gather fix
+    that reports every rank landed after this job was submitted.
+  - **Next levers**, if the goal is to move the held-out number rather
+    than trade noise: `RLVR_MAX_NEW_TOKENS=640` (stop penalising
+    correct-but-long solutions, the main source of negative advantage) and
+    `RLVR_EVAL_N=200` (eval noise floor from +/-2 pts to +/-0.5). Both fit
+    comfortably in the 5 h budget at 8 steps/min.
