@@ -709,3 +709,82 @@ python3 "$LUSTRE_DIR/generate_dashboard.py" "$LOG" --timing "$TIMING" --output "
   multi-GPU hardware.
 - **`nemotron_h` support** requires a recent `transformers`; the launcher
   upgrades it inside the container.
+
+## Quick path: pull the code from GitHub instead of pasting heredocs
+
+The repo ([balakreshnan/Posttraining101](https://github.com/balakreshnan/Posttraining101))
+is public and hecate has outbound internet (the Hugging Face downloads
+prove it), so the four files in section 2 can be fetched with `curl`
+straight from `raw.githubusercontent.com` -- no 450-line paste. The
+heredocs in section 2 remain the byte-identical fallback if `curl` is
+blocked. End-to-end, in order:
+
+### A. Download the BF16 checkpoint (~60GB)
+
+```bash
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
+source "$LUSTRE_DIR/.venv-upload/bin/activate"
+export HF_HOME="$LUSTRE_DIR/hf_cache"
+mkdir -p "$LUSTRE_DIR/out"
+
+hf download nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 2>&1 | tee "$LUSTRE_DIR/out/nemotron35_bf16_download.log"
+deactivate
+du -sh "$LUSTRE_DIR"/hf_cache/hub/models--nvidia--*
+```
+
+No `--local-dir`: the weights land in `hf_cache/hub/`, which is where
+`from_pretrained` resolves the repo id, so nothing is downloaded twice.
+
+### B. Fetch the code from the repo onto Lustre
+
+```bash
+export LUSTRE_DIR="${LUSTRE_DIR:-/lustre/fsw/general_sa/$USER}"
+RAW="https://raw.githubusercontent.com/balakreshnan/Posttraining101/main/rlvr"
+mkdir -p "$LUSTRE_DIR/scripts"
+
+curl -fsSL "$RAW/train_rlvr_nemotron.py"            -o "$LUSTRE_DIR/train_rlvr_nemotron.py"
+curl -fsSL "$RAW/requirements-nemotron.txt"         -o "$LUSTRE_DIR/requirements-nemotron.txt"
+curl -fsSL "$RAW/scripts/launch_rlvr_nemotron.sh"   -o "$LUSTRE_DIR/scripts/launch_rlvr_nemotron.sh"
+curl -fsSL "$RAW/scripts/submit_hecate_nemotron.sh" -o "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+chmod +x "$LUSTRE_DIR/scripts/"*nemotron*.sh
+
+# task.py (shared by every guide) and the insight tools, if not already present
+[ -f "$LUSTRE_DIR/task.py" ]               || curl -fsSL "$RAW/task.py"               -o "$LUSTRE_DIR/task.py"
+[ -f "$LUSTRE_DIR/analyze_run.py" ]        || curl -fsSL "$RAW/analyze_run.py"        -o "$LUSTRE_DIR/analyze_run.py"
+[ -f "$LUSTRE_DIR/generate_dashboard.py" ] || curl -fsSL "$RAW/generate_dashboard.py" -o "$LUSTRE_DIR/generate_dashboard.py"
+
+wc -l "$LUSTRE_DIR/train_rlvr_nemotron.py"                 # expect ~330 lines
+grep -c "_any_rank" "$LUSTRE_DIR/train_rlvr_nemotron.py"   # expect > 0 (confirms the current version)
+```
+
+`curl -fsSL` fails loudly on a 404 or network block instead of writing an
+HTML error page into the `.py` file. To pull a specific commit rather than
+`main`, replace `main` in `RAW` with the commit hash.
+
+### C. Architecture check (seconds, no GPU), then a short run
+
+```bash
+source "$LUSTRE_DIR/.venv-upload/bin/activate"
+pip install -q -U transformers peft accelerate
+HF_HOME="$LUSTRE_DIR/hf_cache" python3 "$LUSTRE_DIR/train_rlvr_nemotron.py" --list-modules 2>&1 | tee "$LUSTRE_DIR/out/nemotron35_modules.txt" | head -60
+deactivate
+
+bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+tail -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"
+```
+
+In the log, in order: `GPU 0: ~60 GiB allocated after load` with GPUs 1-3
+near 0 (expected -- the whole model sits on one GPU); the **`Rendered
+prompt`** -- if it contains a think/reasoning block, this template does
+not use `enable_thinking`; re-run with `RLVR_SYSTEM_PROMPT="/no_think"`
+(check the model card for the exact phrase); the `eval sample`
+completion and a **non-zero baseline accuracy**; `step N/10 | ... |
+rollouts=4/4` lines; `Step accounting: {...}` with `updated` close to
+10; `Saved LoRA adapter to .../out/rlvr-nemotron-run1`.
+
+### D. Scale up, then insights
+
+Section 5 (1000 steps; optional `RLVR_NPROC=4` DDP) and section 6
+(`analyze_run.py` / `generate_dashboard.py`) apply unchanged. To refresh
+the code after a repo update, re-run block B -- `curl` overwrites in
+place.
