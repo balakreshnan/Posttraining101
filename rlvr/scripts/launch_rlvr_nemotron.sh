@@ -35,7 +35,7 @@ COMMON_ARGS=(
   --lr "${RLVR_LR:-1e-5}"
   --eval-n "${RLVR_EVAL_N:-30}"
   --lora-r "${RLVR_LORA_R:-16}"
-  --lora-target-modules "${RLVR_LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj,in_proj,out_proj}"
+  --lora-target-modules "${RLVR_LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj,in_proj}"
   --seed "${RLVR_SEED:-0}"
   --save-dir "$LUSTRE_DIR/out/$RUN_NAME"
 )

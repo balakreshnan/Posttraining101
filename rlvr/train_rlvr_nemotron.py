@@ -55,6 +55,7 @@ and generate_dashboard.py work on the output unchanged.
 import argparse
 import os
 import random
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -124,8 +125,10 @@ def parse_args() -> argparse.Namespace:
         default="q_proj,k_proj,v_proj,o_proj",
         help="Comma-separated module-name suffixes for LoRA. Attention projections by default. "
              "This architecture has only 'select' attention layers, so for more adapter capacity "
-             "consider adding the Mamba-2 projections (typically in_proj,out_proj) -- run "
-             "--list-modules to see the real names first.",
+             "add the Mamba-2 input projection `in_proj`. NOTE: peft refuses `out_proj` and "
+             "`conv1d` on Mamba-based models (nemotron_h) -- they sit on the SSM state path -- "
+             "and raises ValueError at get_peft_model. The dense shared_experts up_proj/down_proj "
+             "are also valid targets. Run --list-modules to see the real names.",
     )
     p.add_argument(
         "--device-map", choices=["single", "auto"], default="single",
@@ -256,25 +259,14 @@ def main() -> None:
     rng = random.Random(args.seed + rank)  # ranks see different problems
     torch.manual_seed(args.seed + rank)
 
-    # Task backend: where rollout problems come from, where eval problems come
-    # from, and how a completion is scored.
-    if args.task == "gsm8k":
-        from gsm8k_task import GSM8K, verify_reward as gsm8k_verify
-        gsm8k = GSM8K()
-        train_sampler, eval_sampler, verify = gsm8k.sample_train, gsm8k.sample_eval, gsm8k_verify
-        if is_main:
-            print(gsm8k.describe())
-            if args.max_new_tokens < 192:
-                print(f"note: --max-new-tokens {args.max_new_tokens} is small for GSM8K reasoning; "
-                      f"256-512 is typical. Truncated-but-correct solutions score 0.1, not 1.0.")
-    else:
-        train_sampler, eval_sampler, verify = sample_batch, sample_batch, verify_reward
-
     if not torch.cuda.is_available():
         raise SystemExit("This script requires CUDA GPUs.")
 
     if distributed:
-        dist.init_process_group(backend="nccl")
+        # Long timeout: only rank 0 runs the greedy eval (eval_n problems x up to
+        # max_new_tokens each) while the other ranks wait at a barrier. With GSM8K
+        # (384 tokens, 30-50 problems) that wait can exceed NCCL's 10-minute default.
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
         load_kwargs = {}
@@ -285,6 +277,25 @@ def main() -> None:
     else:
         device = torch.device("cuda", 0)
         load_kwargs = {}
+
+    # Task backend: where rollout problems come from, where eval problems come
+    # from, and how a completion is scored. Under DDP, rank 0 loads the dataset
+    # first (it may need to download), the others then read it from the cache.
+    if args.task == "gsm8k":
+        from gsm8k_task import GSM8K, verify_reward as gsm8k_verify
+        if distributed and not is_main:
+            dist.barrier()
+        gsm8k = GSM8K()
+        if distributed and is_main:
+            dist.barrier()
+        train_sampler, eval_sampler, verify = gsm8k.sample_train, gsm8k.sample_eval, gsm8k_verify
+        if is_main:
+            print(gsm8k.describe())
+            if args.max_new_tokens < 192:
+                print(f"note: --max-new-tokens {args.max_new_tokens} is small for GSM8K reasoning; "
+                      f"256-512 is typical. Truncated-but-correct solutions score 0.1, not 1.0.")
+    else:
+        train_sampler, eval_sampler, verify = sample_batch, sample_batch, verify_reward
 
     if is_main:
         mode = f"DDP x{world_size} ranks" if distributed else f"single process, device_map={args.device_map}"

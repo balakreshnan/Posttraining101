@@ -56,10 +56,15 @@ previewer) to see the charts.
     2688->256 = heavy GQA, `o_proj` 4096->2688).
   - The default LoRA targets `q_proj,k_proj,v_proj,o_proj` therefore
     match only the attention mixers ("select" layers). For more adapter
-    capacity the real names to add are the Mamba-2 `in_proj,out_proj`
-    and/or `shared_experts.up_proj,shared_experts.down_proj` (peft
-    matches by suffix, so `up_proj,down_proj` also works and hits only
-    the shared experts).
+    capacity the real names to add are the Mamba-2 `in_proj` and/or
+    `shared_experts.up_proj,shared_experts.down_proj` (peft matches by
+    suffix, so `up_proj,down_proj` also works and hits only the shared
+    experts). **Not `out_proj` or `conv1d`**: peft refuses them on
+    Mamba-based models (`ValueError: Module 'out_proj' is incompatible
+    with Mamba-based models (model_type='nemotron_h')`) because they sit
+    on the SSM state path -- job 533662 failed at `get_peft_model` on
+    exactly that; the launcher default is now
+    `q_proj,k_proj,v_proj,o_proj,in_proj`.
   - `k_proj`/`v_proj` are tiny (out=256); most attention LoRA capacity
     will sit in `q_proj`/`o_proj`.
 - [`hecate_nemotron_10step.log`](hecate_nemotron_10step.log) and

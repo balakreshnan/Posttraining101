@@ -132,6 +132,7 @@ and generate_dashboard.py work on the output unchanged.
 import argparse
 import os
 import random
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -201,8 +202,10 @@ def parse_args() -> argparse.Namespace:
         default="q_proj,k_proj,v_proj,o_proj",
         help="Comma-separated module-name suffixes for LoRA. Attention projections by default. "
              "This architecture has only 'select' attention layers, so for more adapter capacity "
-             "consider adding the Mamba-2 projections (typically in_proj,out_proj) -- run "
-             "--list-modules to see the real names first.",
+             "add the Mamba-2 input projection `in_proj`. NOTE: peft refuses `out_proj` and "
+             "`conv1d` on Mamba-based models (nemotron_h) -- they sit on the SSM state path -- "
+             "and raises ValueError at get_peft_model. The dense shared_experts up_proj/down_proj "
+             "are also valid targets. Run --list-modules to see the real names.",
     )
     p.add_argument(
         "--device-map", choices=["single", "auto"], default="single",
@@ -333,25 +336,14 @@ def main() -> None:
     rng = random.Random(args.seed + rank)  # ranks see different problems
     torch.manual_seed(args.seed + rank)
 
-    # Task backend: where rollout problems come from, where eval problems come
-    # from, and how a completion is scored.
-    if args.task == "gsm8k":
-        from gsm8k_task import GSM8K, verify_reward as gsm8k_verify
-        gsm8k = GSM8K()
-        train_sampler, eval_sampler, verify = gsm8k.sample_train, gsm8k.sample_eval, gsm8k_verify
-        if is_main:
-            print(gsm8k.describe())
-            if args.max_new_tokens < 192:
-                print(f"note: --max-new-tokens {args.max_new_tokens} is small for GSM8K reasoning; "
-                      f"256-512 is typical. Truncated-but-correct solutions score 0.1, not 1.0.")
-    else:
-        train_sampler, eval_sampler, verify = sample_batch, sample_batch, verify_reward
-
     if not torch.cuda.is_available():
         raise SystemExit("This script requires CUDA GPUs.")
 
     if distributed:
-        dist.init_process_group(backend="nccl")
+        # Long timeout: only rank 0 runs the greedy eval (eval_n problems x up to
+        # max_new_tokens each) while the other ranks wait at a barrier. With GSM8K
+        # (384 tokens, 30-50 problems) that wait can exceed NCCL's 10-minute default.
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
         load_kwargs = {}
@@ -362,6 +354,25 @@ def main() -> None:
     else:
         device = torch.device("cuda", 0)
         load_kwargs = {}
+
+    # Task backend: where rollout problems come from, where eval problems come
+    # from, and how a completion is scored. Under DDP, rank 0 loads the dataset
+    # first (it may need to download), the others then read it from the cache.
+    if args.task == "gsm8k":
+        from gsm8k_task import GSM8K, verify_reward as gsm8k_verify
+        if distributed and not is_main:
+            dist.barrier()
+        gsm8k = GSM8K()
+        if distributed and is_main:
+            dist.barrier()
+        train_sampler, eval_sampler, verify = gsm8k.sample_train, gsm8k.sample_eval, gsm8k_verify
+        if is_main:
+            print(gsm8k.describe())
+            if args.max_new_tokens < 192:
+                print(f"note: --max-new-tokens {args.max_new_tokens} is small for GSM8K reasoning; "
+                      f"256-512 is typical. Truncated-but-correct solutions score 0.1, not 1.0.")
+    else:
+        train_sampler, eval_sampler, verify = sample_batch, sample_batch, verify_reward
 
     if is_main:
         mode = f"DDP x{world_size} ranks" if distributed else f"single process, device_map={args.device_map}"
@@ -707,7 +718,7 @@ COMMON_ARGS=(
   --lr "${RLVR_LR:-1e-5}"
   --eval-n "${RLVR_EVAL_N:-30}"
   --lora-r "${RLVR_LORA_R:-16}"
-  --lora-target-modules "${RLVR_LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj,in_proj,out_proj}"
+  --lora-target-modules "${RLVR_LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj,in_proj}"
   --seed "${RLVR_SEED:-0}"
   --save-dir "$LUSTRE_DIR/out/$RUN_NAME"
 )
@@ -839,9 +850,12 @@ RLVR_ITERATIONS=1000 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=20 bash "$LUSTRE_DIR/scripts/
 A 3B-active MoE on one GPU should be several times faster per step than
 Qwen3.8 was; check the 10-step timing file before assuming 1000 steps
 fits in the 5h `--time`. Adapter capacity: attention layers are
-"select" in this architecture, so if reward plateaus early, try
-`RLVR_LORA_TARGETS="q_proj,k_proj,v_proj,o_proj,in_proj,out_proj"` (names
-from step 3) to also adapt the Mamba-2 blocks.
+"select" in this architecture, so if reward plateaus early, add the
+Mamba-2 input projection: `RLVR_LORA_TARGETS="q_proj,k_proj,v_proj,o_proj,in_proj"`
+(names from step 3). **Not `out_proj` or `conv1d`**: peft refuses those on
+Mamba-based models (`ValueError: Module 'out_proj' is incompatible with
+Mamba-based models (model_type='nemotron_h')`) because they sit on the
+SSM state path -- job 533662 died on exactly that.
 
 ## 6. Insights and dashboard
 
@@ -1035,7 +1049,56 @@ seconds per step; multiply by 1000.
 
 `RLVR_TASK` defaults to `gsm8k`; `--max-new-tokens` defaults to 384 (64 for
 arith); `--eval-n` defaults to 30; the adapter is saved to
-`out/rlvr-nemotron-gsm8k-run1`; and LoRA now also covers the Mamba-2
-projections (`q_proj,k_proj,v_proj,o_proj,in_proj,out_proj`, names from the
-module inventory) so the adapter has more than the "select" attention
-layers to work with. All overridable via the same `RLVR_*` variables.
+`out/rlvr-nemotron-gsm8k-run1`; and LoRA now also covers the Mamba-2 input
+projection (`q_proj,k_proj,v_proj,o_proj,in_proj`, names from the module
+inventory) so the adapter has more than the "select" attention layers to
+work with. `out_proj`/`conv1d` are deliberately excluded -- peft rejects
+them on Mamba-based models (see section 5). All overridable via the same
+`RLVR_*` variables.
+
+### E. Using all 4 GPUs (DDP) -- and what that does and does not speed up
+
+With `RLVR_NPROC=4` the launcher runs `torchrun --nproc_per_node=4`: four
+full bf16 replicas (~60GB each, one per GPU), each sampling its own
+GSM8K problems, gradients averaged across ranks every step. Two things to
+understand before choosing the numbers:
+
+- **Wall time per step does not shrink.** Each rank still runs its own
+  `--grad-accum` rollouts sequentially, so a step takes as long as on one
+  GPU. What 4 GPUs buy is **4x the samples per step** (a less noisy
+  policy gradient), or -- if you lower `RLVR_GRAD_ACCUM` -- the same
+  samples per step in a quarter of the time.
+- So for **more steps in the same time**: `RLVR_NPROC=4 RLVR_GRAD_ACCUM=1`
+  (4 samples/step, ~4x faster than single-GPU accum-4). For a **bigger
+  batch at the same speed**: `RLVR_NPROC=4 RLVR_GRAD_ACCUM=4` (16
+  samples/step).
+
+The DDP path has not been exercised on multi-GPU hardware before, so use a
+100-step run to validate it rather than committing to 1000 blind. Rank 0
+alone prints and evaluates; the other ranks wait at a barrier during eval
+(the process group is created with a 2-hour timeout for that reason), and
+rank 0 loads the dataset first so four ranks don't race a cold cache.
+
+```bash
+# 100-step DDP validation: 4 GPUs x 1 rollout = 4 samples/step, ~9-10 s/step, ~20-25 min total
+RLVR_NPROC=4 RLVR_GRAD_ACCUM=1 RLVR_ITERATIONS=100 RLVR_EVAL_N=30 \
+  bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+tail -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"
+```
+
+Confirm in the log: `Loading ... (DDP x4 ranks)`; **all four** `GPU N: ~59
+GiB allocated` lines; `Training: ... x 4 ranks`; step lines arriving at
+roughly a quarter of the single-GPU interval; `Step accounting` with
+`updated` ~100 and no rollbacks. Then the long run:
+
+```bash
+mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"    "$LUSTRE_DIR/out/hecate_nemotron_gsm8k_ddp100.log"
+mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.timing" "$LUSTRE_DIR/out/hecate_nemotron_gsm8k_ddp100.timing"
+
+# 1000 steps x 4 GPUs x 1 rollout: ~2.5-3 h, fits the 5 h limit
+RLVR_NPROC=4 RLVR_GRAD_ACCUM=1 RLVR_ITERATIONS=1000 RLVR_EVAL_N=50 \
+  bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+```
+
+If the 100-step run shows a hang at a barrier or an NCCL error, fall back
+to the single-GPU options in section C -- that path is proven.
