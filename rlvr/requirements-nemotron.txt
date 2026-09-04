@@ -1,0 +1,8 @@
+# For train_rlvr_nemotron.py inside the gitlab-master.nvidia.com/dl/dgx/pytorch:main-py3-devel
+# container. The container's torch/CUDA is reused (not reinstalled). No bitsandbytes: the
+# BF16 checkpoint (~60GB) fits on one ~280GB GPU, so nothing is quantised.
+# If loading fails with an unrecognised `nemotron_h` architecture, the container's
+# transformers is too old -- `pip install -U transformers` first.
+transformers>=4.57
+accelerate>=1.0
+peft>=0.13

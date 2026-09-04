@@ -22,10 +22,15 @@ blocks see:
   150 iterations (the originally validated run)
 - [`executeshell-multigpu.md`](executeshell-multigpu.md) — 4-GPU DDP via
   `torchrun`, 1000 iterations (current default)
-- [`executeshell-qwen38.md`](executeshell-qwen38.md) — **experimental**,
-  unverified: LoRA fine-tuning of the ~180B param multimodal
-  Qwen3.8-Flash-Next via 4-bit quantization + `device_map="auto"`
-  (not DDP -- the model doesn't fit as full replicas)
+- [`executeshell-qwen38.md`](executeshell-qwen38.md) — LoRA fine-tuning
+  of the ~180B param multimodal Qwen3.8-Flash-Next, bf16 sharded across
+  the node's GPUs with `device_map="auto"` (not DDP -- one replica per
+  GPU doesn't fit). Validated: 20% -> 100% over 1000 steps, with the
+  gradient/parameter guards absorbing 311 non-finite steps
+- [`executeshell-nemotron.md`](executeshell-nemotron.md) — LoRA
+  fine-tuning of NVIDIA Nemotron-3.5-Lightning-30B-A3B (BF16, ~60GB, fits
+  on one GPU; optional 4-replica DDP). Same guards as the Qwen3.8 flow.
+  Code path verified locally with a small model; not yet run on hecate
 
 ## 1. Write the code to Lustre
 
