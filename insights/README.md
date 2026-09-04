@@ -91,3 +91,17 @@ previewer) to see the charts.
     1000-step run needs a harder verifiable task first (larger operands
     / multi-step expressions in `task.py`, or a real dataset such as
     GSM8K).
+- **GSM8K, 100-step DDP validation (job 533698):** `--task gsm8k`, 4
+  ranks x 1 rollout, LoRA on `q_proj,k_proj,v_proj,o_proj,in_proj`
+  (6.65M trainable params), 384 new tokens. ~25 min wall including model
+  load and two 30-problem evals (~12 s/step). `Step accounting: updated
+  100, 0 / 0 / 0`. **Held-out test-split accuracy 93.3% -> 96.7%**
+  (28 -> 29 of 30 -- within noise at n=30, but the first genuinely
+  held-out number in this project and the right direction). The DDP path
+  is therefore validated on hardware. Observed: this model is already
+  strong on GSM8K (~93-94% baseline), so headroom is a few points, not
+  tens; and most 0.1 rewards are correct-looking solutions truncated at
+  384 tokens, not wrong answers -- `RLVR_MAX_NEW_TOKENS=640` is the lever
+  if that should stop being penalised. The 1000-step DDP run (job 533869,
+  4 x 1 rollout, 50-problem evals, baseline 94.0%) is in flight; its log
+  and dashboard will be added here when it finishes.

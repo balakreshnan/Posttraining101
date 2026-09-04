@@ -22,8 +22,9 @@ What is different from the Qwen3.8 flow, and why:
   so faster per step than Qwen3.8's `device_map="auto"` sharding.
 - Because it also fits *per GPU*, `RLVR_NPROC=4` runs data-parallel via
   `torchrun` (one replica per GPU, like the 1.5B run) with the guards
-  synchronised across ranks. **Untested** -- complete a single-process
-  run first.
+  synchronised across ranks. **Validated** on hecate by job 533698
+  (GSM8K, 100 steps x 4 ranks, 25 min, held-out 93.3% -> 96.7%, all
+  guards clean) -- see section 7E.
 - Mamba-2 layers are recurrent: `--batch-size` stays 1 (pad tokens
   entering a recurrence is what crashed Qwen3.8 runs 1-3); the batch
   comes from `--grad-accum`.
@@ -36,7 +37,10 @@ Verified locally on the identical code path with Qwen2.5-1.5B-Instruct
 (arith: 3 steps x 2 rollouts, 0% -> 75%; gsm8k: 2 steps x 2 rollouts,
 held-out 33% -> 67% on 3 problems; all guards clean, adapters saved).
 On hecate: the arith 10-step run (job 533496) completed cleanly at 100%
-baseline -- see [`../../insights/`](../../insights/); GSM8K not yet run.
+baseline; the GSM8K 100-step DDP run (job 533698, 4 ranks) completed in
+25 min with held-out accuracy 93.3% -> 96.7% -- see
+[`../../insights/`](../../insights/). The 1000-step DDP run is the next
+step (section 7E).
 
 ## 1. Download the model weights
 
@@ -852,8 +856,10 @@ mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.timing" "$LUSTRE_DIR/out/hecate_nemo
 # single process, 1000 steps x 4 rollouts
 RLVR_ITERATIONS=1000 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=20 bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
 
-# OR data-parallel on all 4 GPUs (untested): 4 replicas x 4 rollouts = 16 samples/step
-# RLVR_NPROC=4 RLVR_ITERATIONS=1000 RLVR_GRAD_ACCUM=4 RLVR_EVAL_N=20 bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
+# OR data-parallel on all 4 GPUs (validated, see section 7E). Note the trade-off:
+# RLVR_GRAD_ACCUM=1 -> 4 samples/step in ~1/4 the wall time; RLVR_GRAD_ACCUM=4 -> 16 samples/step
+# at the same wall time as single-GPU. A DDP step waits for the slowest rank's rollout.
+# RLVR_NPROC=4 RLVR_GRAD_ACCUM=1 RLVR_ITERATIONS=1000 RLVR_EVAL_N=50 bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
 ```
 
 A 3B-active MoE on one GPU should be several times faster per step than
@@ -1082,11 +1088,14 @@ understand before choosing the numbers:
   batch at the same speed**: `RLVR_NPROC=4 RLVR_GRAD_ACCUM=4` (16
   samples/step).
 
-The DDP path has not been exercised on multi-GPU hardware before, so use a
-100-step run to validate it rather than committing to 1000 blind. Rank 0
-alone prints and evaluates; the other ranks wait at a barrier during eval
-(the process group is created with a 2-hour timeout for that reason), and
-rank 0 loads the dataset first so four ranks don't race a cold cache.
+The DDP path was validated by job 533698: GSM8K, 100 steps x 4 ranks x 1
+rollout, ~25 min wall including model load and two 30-problem evals,
+`Step accounting: updated 100, 0 / 0 / 0`, held-out accuracy 93.3% ->
+96.7% (28 -> 29 of 30; within noise, but the right direction). A 100-step
+run is still the right first move after any code change. Rank 0 alone
+prints and evaluates; the other ranks wait at a barrier during eval (the
+process group is created with a 2-hour timeout for that reason), and rank
+0 loads the dataset first so four ranks don't race a cold cache.
 
 ```bash
 # 100-step DDP validation: 4 GPUs x 1 rollout = 4 samples/step, ~9-10 s/step, ~20-25 min total
@@ -1095,19 +1104,55 @@ RLVR_NPROC=4 RLVR_GRAD_ACCUM=1 RLVR_ITERATIONS=100 RLVR_EVAL_N=30 \
 tail -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"
 ```
 
-Confirm in the log: `Loading ... (DDP x4 ranks)`; **all four** `GPU N: ~59
-GiB allocated` lines; `Training: ... x 4 ranks`; step lines arriving at
-roughly a quarter of the single-GPU interval; `Step accounting` with
-`updated` ~100 and no rollbacks. Then the long run:
+Confirm in the log: `Loading ... (DDP x4 ranks)`; **four** `Loading
+weights` progress bars (one per rank); four `GPU N: ~59 GiB allocated
+after load (rank-local replica)` lines; `Training: ... x 4 ranks`; `Step
+accounting` with `updated` ~100 and no rollbacks.
+
+> Older versions of the script printed `GPU 1-3: 0.0 GiB` under DDP.
+> That was a bug in the diagnostic, not the training: `memory_allocated()`
+> is per-process and only rank 0 prints, so it could not see the other
+> ranks' replicas. Fixed in `444aeeb` -- each rank now reports its own GPU.
+
+The check that cannot be fooled is `nvidia-smi` on the compute node. Use
+the non-interactive form -- `--pty watch` may print nothing in some
+terminal setups:
+
+```bash
+JOBID=$(squeue -u $USER -h -o %A | head -1)
+srun --jobid="$JOBID" --overlap nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
+srun --jobid="$JOBID" --overlap nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv
+```
+
+Expect four rows with ~60 GB used on every GPU and four `python`
+processes. Then the long run:
 
 ```bash
 mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.log"    "$LUSTRE_DIR/out/hecate_nemotron_gsm8k_ddp100.log"
 mv -f "$LUSTRE_DIR/out/hecate_nemotron_run1.timing" "$LUSTRE_DIR/out/hecate_nemotron_gsm8k_ddp100.timing"
 
-# 1000 steps x 4 GPUs x 1 rollout: ~2.5-3 h, fits the 5 h limit
+# 1000 steps x 4 GPUs x 1 rollout. Budget ~3.5-4 h (inside the 5 h limit):
+# the 100-step run did ~12 s/step, and a DDP step is the SLOWEST of the 4
+# rollouts, so it stays pinned near the 384-token worst case; the two
+# 50-problem evals add ~3 min each.
 RLVR_NPROC=4 RLVR_GRAD_ACCUM=1 RLVR_ITERATIONS=1000 RLVR_EVAL_N=50 \
   bash "$LUSTRE_DIR/scripts/submit_hecate_nemotron.sh"
 ```
 
-If the 100-step run shows a hang at a barrier or an NCCL error, fall back
-to the single-GPU options in section C -- that path is proven.
+Measure the actual step rate a few minutes in, rather than guessing:
+
+```bash
+LOG="$LUSTRE_DIR/out/hecate_nemotron_run1.log"
+for i in 1 2 3; do echo "$(date +%T)  steps=$(grep -c '^step ' "$LOG")"; sleep 60; done
+```
+
+That prints the completed-step count once a minute for three minutes; the
+difference is steps/minute. At ~4-5 steps/min, 1000 steps finish in
+~3.5-4 h. Below ~3.5/min the run will hit the 5 h `--time` limit -- and
+**the adapter is only saved at the end**, so a timeout loses it. In that
+case do not cancel on a hunch; if the rate is genuinely too low, `scancel`
+early and resubmit with `RLVR_ITERATIONS=600`, or switch the submit script
+to the 8 h `backfill-xdr` partition (see section C).
+
+If the run shows a hang at a barrier or an NCCL error, fall back to the
+single-GPU options in section C -- that path is proven.
